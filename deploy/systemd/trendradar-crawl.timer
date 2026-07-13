@@ -1,0 +1,11 @@
+[Unit]
+Description=Run TrendRadar crawl hourly
+
+[Timer]
+OnCalendar=hourly
+# 热点数据不补跑停机期间的旧小时，避免开机后意外重复推送。
+Persistent=false
+Unit=trendradar-crawl.service
+
+[Install]
+WantedBy=timers.target

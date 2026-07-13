@@ -7,6 +7,7 @@
 - generate_html_report: 生成 HTML 报告
 """
 
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Callable
 
@@ -43,30 +44,28 @@ def prepare_report_data(
         for t in stat.get("titles", [])
     }
 
-    # 过滤新增标题：只保留在 stats 中存活的标题（即通过了 AI/关键词过滤的标题）
-    filtered_new_titles = {}
+    # 新增区域表示「本次真正新出现」的内容，不受关键词/AI 筛选影响。
+    # stats 仍可用于 hotlist/rss 统计区域，但不应删除 new_items。
+    display_new_titles = {}
     if new_titles and id_to_name:
         for source_id, titles_data in new_titles.items():
-            filtered_titles = {}
-            for title, title_data in titles_data.items():
-                if title in stats_title_set:
-                    filtered_titles[title] = title_data
-            if filtered_titles:
-                filtered_new_titles[source_id] = filtered_titles
+            if titles_data:
+                display_new_titles[source_id] = dict(titles_data)
 
-        original_new_count = sum(len(titles) for titles in new_titles.values()) if new_titles else 0
-        filtered_new_count = sum(len(titles) for titles in filtered_new_titles.values()) if filtered_new_titles else 0
-        if original_new_count > 0:
-            print(f"新增热点过滤后：{filtered_new_count} 条保留（原始 {original_new_count} 条）")
+        new_count = sum(len(titles) for titles in display_new_titles.values())
+        if new_count > 0:
+            print(f"新增热点保留：{new_count} 条（未经关键词/AI 筛选）")
 
-    # 在增量模式下或配置关闭时隐藏新增新闻区域（但计数已完成）
-    # 当全部热榜条目都是新增时（首次运行），也隐藏以避免与主区域完全重复
-    all_new_titles = {title for titles in filtered_new_titles.values() for title in titles}
+    # 配置关闭时隐藏新增新闻区域（但计数已完成）。
+    # 当全部热榜条目都是新增时（首次运行），在 current/daily 模式下隐藏以避免与主区域重复。
+    # 注意：incremental 模式下，用户可能只在 display.region_order 中启用 new_items；
+    # 如果这里强制隐藏，会导致热榜新增只计数、不显示，只剩 RSS 新增可见。
+    all_new_titles = {title for titles in display_new_titles.values() for title in titles}
     all_are_new = bool(all_new_titles) and all_new_titles == stats_title_set
-    hide_new_section = mode == "incremental" or not show_new_section or all_are_new
+    hide_new_section = not show_new_section or (mode != "incremental" and all_are_new)
 
-    if not hide_new_section and filtered_new_titles and id_to_name:
-        for source_id, titles_data in filtered_new_titles.items():
+    if not hide_new_section and display_new_titles and id_to_name:
+        for source_id, titles_data in display_new_titles.items():
             source_name = id_to_name.get(source_id, source_id)
             source_titles = []
 
@@ -128,8 +127,8 @@ def prepare_report_data(
             }
         )
 
-    # total_new_count 始终从过滤结果计算（用于头部统计），不受 hide_new_section 影响
-    total_new_count = sum(len(titles) for titles in filtered_new_titles.values())
+    # total_new_count 表示真实新增数，不受关键词匹配或 hide_new_section 影响。
+    total_new_count = sum(len(titles) for titles in display_new_titles.values())
 
     return {
         "stats": processed_stats,
@@ -161,7 +160,7 @@ def generate_html_report(
     每次生成 HTML 后会：
     1. 保存时间戳快照到 output/html/日期/时间.html（历史记录）
     2. 复制到 output/html/latest/{mode}.html（最新报告）
-    3. 复制到 output/index.html 和根目录 index.html（入口）
+    3. 复制到 output/index.html；GitHub Actions 中另更新根目录 index.html
 
     Args:
         stats: 统计结果列表
@@ -238,9 +237,11 @@ def generate_html_report(
     with open(output_index, "w", encoding="utf-8") as f:
         f.write(html_content)
 
-    # 根目录 index.html（供 GitHub Pages 访问）
-    root_index = Path("index.html")
-    with open(root_index, "w", encoding="utf-8") as f:
-        f.write(html_content)
+    # 根目录 index.html 是版本控制的 GitHub Pages 入口。
+    # 常驻服务器只写 output，避免每小时污染代码工作树。
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        root_index = Path("index.html")
+        with open(root_index, "w", encoding="utf-8") as f:
+            f.write(html_content)
 
     return snapshot_file

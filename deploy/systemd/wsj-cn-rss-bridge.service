@@ -1,0 +1,18 @@
+[Unit]
+Description=WSJ Chinese RSS Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trendradar
+Group=trendradar
+WorkingDirectory=/opt/trendradar
+Environment=HOME=/var/lib/trendradar
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/trendradar/scripts/wsj_cn_rss_bridge.py --host 127.0.0.1 --port 4555 --ttl 900
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

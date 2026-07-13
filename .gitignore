@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+
+# Local credentials and machine-specific overrides
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+config/*.local.yaml
+config/*.local.yml
+config/secrets.*
+
+config/config.yaml.bak.*
+
+output/html/
+output/logs/
+output/meta/
+output/rss/
+output/txt/
+output/index.html
+output/news/*.db

@@ -72,6 +72,11 @@ def run_test_notification(config: Dict) -> bool:
         has_notification = any(
             [
                 config.get("FEISHU_WEBHOOK_URL"),
+                (
+                    config.get("FEISHU_APP_ID")
+                    and config.get("FEISHU_APP_SECRET")
+                    and config.get("FEISHU_RECEIVE_ID")
+                ),
                 config.get("DINGTALK_WEBHOOK_URL"),
                 config.get("WEWORK_WEBHOOK_URL"),
                 (config.get("TELEGRAM_BOT_TOKEN") and config.get("TELEGRAM_CHAT_ID")),

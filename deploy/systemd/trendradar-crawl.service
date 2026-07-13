@@ -1,0 +1,16 @@
+[Unit]
+Description=Run TrendRadar crawl once
+After=network-online.target wsj-cn-rss-bridge.service economist-rss-bridge.service
+Wants=network-online.target wsj-cn-rss-bridge.service economist-rss-bridge.service
+
+[Service]
+Type=oneshot
+User=trendradar
+Group=trendradar
+WorkingDirectory=/opt/trendradar
+Environment=HOME=/var/lib/trendradar
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-/etc/trendradar/feishu.env
+ExecStart=/usr/local/bin/uv run python -m trendradar
+TimeoutStartSec=15min

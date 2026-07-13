@@ -12,6 +12,7 @@
 import json
 import random
 import time
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 from urllib.parse import urlparse
 
@@ -37,6 +38,8 @@ class DataFetcher:
         self,
         proxy_url: Optional[str] = None,
         api_url: Optional[str] = None,
+        fallback_cache_path: Optional[Union[str, Path]] = None,
+        fallback_max_age_seconds: int = 6 * 60 * 60,
     ):
         """
         初始化数据获取器
@@ -44,9 +47,71 @@ class DataFetcher:
         Args:
             proxy_url: 代理服务器 URL（可选）
             api_url: API 基础 URL（可选，默认使用 DEFAULT_API_URL）
+            fallback_cache_path: 最后一次成功响应缓存路径（可选）
+            fallback_max_age_seconds: 失败时可使用的缓存最长时间
         """
         self.proxy_url = proxy_url
         self.api_url = api_url or self.DEFAULT_API_URL
+        self.fallback_cache_path = Path(fallback_cache_path) if fallback_cache_path else None
+        self.fallback_max_age_seconds = max(0, fallback_max_age_seconds)
+        self.fallback_ids: List[str] = []
+
+    def _load_fallback_cache(self) -> Dict:
+        """读取最后成功响应缓存，损坏的缓存不影响抓取。"""
+        empty_cache = {"version": 1, "sources": {}}
+        if not self.fallback_cache_path or not self.fallback_cache_path.exists():
+            return empty_cache
+
+        try:
+            cache = json.loads(self.fallback_cache_path.read_text(encoding="utf-8"))
+            if not isinstance(cache, dict) or not isinstance(cache.get("sources"), dict):
+                raise ValueError("缓存格式无效")
+            return cache
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"[抓取缓存] 读取失败，将忽略缓存: {e}")
+            return empty_cache
+
+    def _save_fallback_cache(self, cache: Dict) -> None:
+        """原子保存最后成功响应缓存。"""
+        if not self.fallback_cache_path:
+            return
+
+        try:
+            self.fallback_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.fallback_cache_path.with_name(
+                f"{self.fallback_cache_path.name}.tmp"
+            )
+            temp_path.write_text(
+                json.dumps(cache, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            temp_path.replace(self.fallback_cache_path)
+        except OSError as e:
+            print(f"[抓取缓存] 保存失败，不影响本次抓取: {e}")
+
+    def _get_fallback_response(self, cache: Dict, source_id: str) -> Optional[Tuple[str, int]]:
+        """返回未过期的缓存响应和缓存年龄（秒）。"""
+        entry = cache.get("sources", {}).get(source_id)
+        if not isinstance(entry, dict):
+            return None
+
+        fetched_at = entry.get("fetched_at")
+        response = entry.get("response")
+        if not isinstance(fetched_at, (int, float)) or not isinstance(response, str):
+            return None
+
+        age_seconds = max(0, int(time.time() - fetched_at))
+        if age_seconds > self.fallback_max_age_seconds:
+            return None
+
+        try:
+            cached_data = json.loads(response)
+            if not isinstance(cached_data.get("items"), list):
+                return None
+        except (AttributeError, TypeError, json.JSONDecodeError):
+            return None
+
+        return response, age_seconds
 
     @staticmethod
     def _check_domain_safety(
@@ -171,6 +236,9 @@ class DataFetcher:
         id_to_name = {}
         failed_ids = []
         domain_rules = domain_rules or {}
+        self.fallback_ids = []
+        fallback_cache = self._load_fallback_cache()
+        cache_dirty = False
 
         for i, id_info in enumerate(ids_list):
             if isinstance(id_info, tuple):
@@ -181,6 +249,21 @@ class DataFetcher:
 
             id_to_name[id_value] = name
             response, _, _ = self.fetch_data(id_info)
+            used_fallback = False
+
+            if not response:
+                cached = self._get_fallback_response(fallback_cache, id_value)
+                if cached:
+                    response, age_seconds = cached
+                    used_fallback = True
+                    self.fallback_ids.append(id_value)
+                    if id_value not in failed_ids:
+                        failed_ids.append(id_value)
+                    age_minutes = max(1, age_seconds // 60)
+                    print(
+                        f"[抓取缓存] {id_value} 上游失败，"
+                        f"使用 {age_minutes} 分钟前的最后成功数据"
+                    )
 
             if response:
                 try:
@@ -219,14 +302,24 @@ class DataFetcher:
                                 "url": url,
                                 "mobileUrl": mobile_url,
                             }
+
+                    if not used_fallback:
+                        fallback_cache.setdefault("sources", {})[id_value] = {
+                            "fetched_at": time.time(),
+                            "response": response,
+                        }
+                        cache_dirty = True
                 except json.JSONDecodeError:
                     print(f"解析 {id_value} 响应失败")
-                    failed_ids.append(id_value)
+                    if id_value not in failed_ids:
+                        failed_ids.append(id_value)
                 except Exception as e:
                     print(f"处理 {id_value} 数据出错: {e}")
-                    failed_ids.append(id_value)
+                    if id_value not in failed_ids:
+                        failed_ids.append(id_value)
             else:
-                failed_ids.append(id_value)
+                if id_value not in failed_ids:
+                    failed_ids.append(id_value)
 
             # 请求间隔（除了最后一个）
             if i < len(ids_list) - 1:
@@ -234,5 +327,14 @@ class DataFetcher:
                 actual_interval = max(50, actual_interval)
                 time.sleep(actual_interval / 1000)
 
-        print(f"成功: {list(results.keys())}, 失败: {failed_ids}")
+        if cache_dirty:
+            self._save_fallback_cache(fallback_cache)
+
+        fresh_success_ids = [
+            source_id for source_id in results if source_id not in self.fallback_ids
+        ]
+        print(
+            f"成功: {fresh_success_ids}, 缓存回退: {self.fallback_ids}, "
+            f"失败: {failed_ids}"
+        )
         return results, id_to_name, failed_ids

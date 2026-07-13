@@ -8,6 +8,7 @@ TrendRadar 主程序
 
 import argparse
 import os
+import time
 import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -78,14 +79,21 @@ class NewsAnalyzer:
         self.data_fetcher = DataFetcher(
             self.proxy_url,
             api_url=self.ctx.config.get("PLATFORMS_API_URL") or None,
+            fallback_cache_path=Path("output") / "meta" / "hotlist-last-success.json",
         )
 
         # RSS/平台元数据（用于报告头部展示）
         self._rss_source_total = 0
         self._rss_source_failed = 0
+        self._rss_failed_ids = []
+        self._rss_fetched_count = 0
         self._rss_total_count = 0
         self._rss_matched_count = 0
         self._hotlist_total_count = 0
+        self._platform_failed_ids = []
+        self._platform_fallback_ids = []
+        self._notification_attempted = False
+        self._notification_success = None
 
         # 初始化存储管理器（使用 AppContext）
         self._init_storage_manager()
@@ -155,12 +163,27 @@ class NewsAnalyzer:
         """获取当前模式的策略配置"""
         return self.MODE_STRATEGIES.get(self.report_mode, self.MODE_STRATEGIES["daily"])
 
+    def _apply_resolved_schedule(self, schedule: ResolvedSchedule) -> None:
+        """在抓取和 RSS 处理前应用调度决策。"""
+        effective_mode = schedule.report_mode
+        if effective_mode != self.report_mode:
+            print(f"[调度] 报告模式覆盖: {self.report_mode} -> {effective_mode}")
+        self.report_mode = effective_mode
+        self.frequency_file = schedule.frequency_file
+        self.filter_method = schedule.filter_method or self.ctx.filter_method
+        self.interests_file = schedule.interests_file
+
     def _has_notification_configured(self) -> bool:
         """检查是否配置了任何通知渠道"""
         cfg = self.ctx.config
         return any(
             [
                 cfg["FEISHU_WEBHOOK_URL"],
+                (
+                    cfg.get("FEISHU_APP_ID")
+                    and cfg.get("FEISHU_APP_SECRET")
+                    and cfg.get("FEISHU_RECEIVE_ID")
+                ),
                 cfg["DINGTALK_WEBHOOK_URL"],
                 cfg["WEWORK_WEBHOOK_URL"],
                 (cfg["TELEGRAM_BOT_TOKEN"] and cfg["TELEGRAM_CHAT_ID"]),
@@ -181,10 +204,12 @@ class NewsAnalyzer:
     ) -> bool:
         """检查是否有有效的新闻内容"""
         if self.report_mode == "incremental":
-            # 增量模式：只要有匹配的新闻就推送
-            # count_word_frequency 已经确保只处理新增的新闻（包括当天第一次爬取的情况）
+            # 增量模式：任何真实新增都应触发推送，不依赖关键词统计。
             has_matched_news = any(stat["count"] > 0 for stat in stats)
-            return has_matched_news
+            has_new_news = bool(
+                new_titles and any(len(titles) > 0 for titles in new_titles.values())
+            )
+            return has_matched_news or has_new_news
         elif self.report_mode == "current":
             # current模式：只要stats有内容就说明有匹配的新闻
             return any(stat["count"] > 0 for stat in stats)
@@ -684,10 +709,10 @@ class NewsAnalyzer:
                 )
                 total_titles = sum(len(titles) for titles in data_source.values())
 
-                # AI 筛选成功：无条件用 AI 结果替换 RSS 主区与新增区（与热榜 stats 一致，
-                # 不因 AI 命中为空而回退到关键词结果）
+                # AI 筛选仅影响 RSS 主区；新增区保留抓取阶段生成的全部新条目。
                 rss_items = ai_rss_stats
-                rss_new_items = ai_rss_new_stats
+                if rss_new_items is None:
+                    rss_new_items = ai_rss_new_stats
             else:
                 # AI 筛选失败，回退到关键词匹配
                 error_msg = ai_filter_result.error if ai_filter_result else "未知错误"
@@ -811,12 +836,21 @@ class NewsAnalyzer:
 
         # 检查是否有有效内容（热榜或RSS）
         has_news_content = self._has_valid_content(stats, new_titles)
-        has_rss_content = bool(rss_items and len(rss_items) > 0)
+        has_rss_content = bool(
+            (rss_items and len(rss_items) > 0)
+            or (rss_new_items and len(rss_new_items) > 0)
+        )
         has_any_content = has_news_content or has_rss_content
 
         # 计算热榜匹配条数
-        news_count = sum(len(stat.get("titles", [])) for stat in stats) if stats else 0
-        rss_count = sum(stat.get("count", 0) for stat in rss_items) if rss_items else 0
+        if mode == "incremental":
+            news_count = sum(len(titles) for titles in (new_titles or {}).values())
+            rss_count = sum(
+                len(stat.get("titles", [])) for stat in (rss_new_items or [])
+            )
+        else:
+            news_count = sum(len(stat.get("titles", [])) for stat in stats) if stats else 0
+            rss_count = sum(stat.get("count", 0) for stat in rss_items) if rss_items else 0
 
         if (
             cfg["ENABLE_NOTIFICATION"]
@@ -886,10 +920,14 @@ class NewsAnalyzer:
                 standalone_data=standalone_data,
                 skip_translation=True,
             )
+            self._notification_attempted = True
 
             if not results:
                 print("未配置任何通知渠道，跳过通知发送")
+                self._notification_success = False
                 return False
+
+            self._notification_success = all(results.values())
 
             # 记录推送成功
             if any(results.values()):
@@ -966,12 +1004,23 @@ class NewsAnalyzer:
         results, id_to_name, failed_ids = self.data_fetcher.crawl_websites(
             ids, self.request_interval, domain_rules=domain_rules
         )
+        self._platform_failed_ids = list(failed_ids)
+        self._platform_fallback_ids = list(self.data_fetcher.fallback_ids)
+
+        # 回退数据只用于当前榜单展示，不写入数据库，
+        # 避免将旧排名记成本小时的新数据。
+        fallback_ids = set(self._platform_fallback_ids)
+        persisted_results = {
+            source_id: titles
+            for source_id, titles in results.items()
+            if source_id not in fallback_ids
+        }
 
         # 转换为 NewsData 格式并保存到存储后端
         crawl_time = self.ctx.format_time()
         crawl_date = self.ctx.format_date()
         news_data = convert_crawl_results_to_news_data(
-            results, id_to_name, failed_ids, crawl_time, crawl_date
+            persisted_results, id_to_name, failed_ids, crawl_time, crawl_date
         )
 
         # 保存到存储后端（SQLite）
@@ -1068,6 +1117,8 @@ class NewsAnalyzer:
 
             self._rss_source_total = len(feeds)
             self._rss_source_failed = len(rss_data.failed_ids)
+            self._rss_failed_ids = list(rss_data.failed_ids)
+            self._rss_fetched_count = rss_data.get_total_count()
 
             # 保存到存储后端
             if self.storage_manager.save_rss_data(rss_data):
@@ -1131,7 +1182,11 @@ class NewsAnalyzer:
         if self.report_mode == "incremental":
             new_items_dict = self.storage_manager.detect_new_rss_items(rss_data)
             if new_items_dict:
-                raw_rss_items = self._convert_rss_items_to_list(new_items_dict, rss_data.id_to_name)
+                raw_rss_items = self._convert_rss_items_to_list(
+                    new_items_dict,
+                    rss_data.id_to_name,
+                    apply_freshness_filter=False,
+                )
         elif self.report_mode == "current":
             latest_data = self.storage_manager.get_latest_rss_data(rss_data.date)
             if latest_data:
@@ -1149,7 +1204,11 @@ class NewsAnalyzer:
         new_items_dict = self.storage_manager.detect_new_rss_items(rss_data)
         new_items_list = None
         if new_items_dict:
-            new_items_list = self._convert_rss_items_to_list(new_items_dict, rss_data.id_to_name)
+            new_items_list = self._convert_rss_items_to_list(
+                new_items_dict,
+                rss_data.id_to_name,
+                apply_freshness_filter=False,
+            )
             if new_items_list:
                 print(f"[RSS] 检测到 {len(new_items_list)} 条新增")
                 # 收集原始新增 URLs（未经关键词过滤，用于 AI 模式 is_new 检测）
@@ -1157,27 +1216,24 @@ class NewsAnalyzer:
 
         # 3. 根据模式获取统计条目
         if self.report_mode == "incremental":
-            # 增量模式：统计条目就是新增条目
+            # 增量模式：新增区域保留所有新 RSS，不进行关键词/AI 筛选。
             if not new_items_list:
                 print("[RSS] 增量模式：没有新增 RSS 条目")
                 return None, None, raw_rss_items, rss_new_urls
 
-            rss_stats, total = count_rss_frequency(
+            rss_new_stats, total = count_rss_frequency(
                 rss_items=new_items_list,
-                word_groups=word_groups,
-                filter_words=filter_words,
-                global_filters=global_filters,
+                word_groups=[],
+                filter_words=[],
+                global_filters=[],
                 new_items=new_items_list,  # 增量模式所有都是新增
-                max_news_per_keyword=max_news_per_keyword,
+                max_news_per_keyword=0,
                 sort_by_position_first=sort_by_position_first,
                 timezone=timezone,
                 rank_threshold=self.rank_threshold,
                 quiet=False,
             )
-            if not rss_stats:
-                print("[RSS] 增量模式：关键词匹配后没有内容")
-                # 即使关键词匹配为空，也返回原始条目用于独立展示区
-                return None, None, raw_rss_items, rss_new_urls
+            rss_stats = None
 
         elif self.report_mode == "current":
             # 当前榜单模式：统计=当前榜单所有条目
@@ -1200,18 +1256,17 @@ class NewsAnalyzer:
             )
             if not rss_stats:
                 print("[RSS] 当前榜单模式：关键词匹配后没有内容")
-                # 即使关键词匹配为空，也返回原始条目用于独立展示区
-                return None, None, raw_rss_items, rss_new_urls
+                rss_stats = None
 
-            # 生成新增统计
+            # 生成新增统计：新增区域不应再受关键词过滤。
             if new_items_list:
                 rss_new_stats, _ = count_rss_frequency(
                     rss_items=new_items_list,
-                    word_groups=word_groups,
-                    filter_words=filter_words,
-                    global_filters=global_filters,
+                    word_groups=[],
+                    filter_words=[],
+                    global_filters=[],
                     new_items=new_items_list,
-                    max_news_per_keyword=max_news_per_keyword,
+                    max_news_per_keyword=0,
                     sort_by_position_first=sort_by_position_first,
                     timezone=timezone,
                     rank_threshold=self.rank_threshold,
@@ -1239,18 +1294,17 @@ class NewsAnalyzer:
             )
             if not rss_stats:
                 print("[RSS] 当日汇总模式：关键词匹配后没有内容")
-                # 即使关键词匹配为空，也返回原始条目用于独立展示区
-                return None, None, raw_rss_items, rss_new_urls
+                rss_stats = None
 
-            # 生成新增统计
+            # 生成新增统计：新增区域不应再受关键词过滤。
             if new_items_list:
                 rss_new_stats, _ = count_rss_frequency(
                     rss_items=new_items_list,
-                    word_groups=word_groups,
-                    filter_words=filter_words,
-                    global_filters=global_filters,
+                    word_groups=[],
+                    filter_words=[],
+                    global_filters=[],
                     new_items=new_items_list,
-                    max_news_per_keyword=max_news_per_keyword,
+                    max_news_per_keyword=0,
                     sort_by_position_first=sort_by_position_first,
                     timezone=timezone,
                     rank_threshold=self.rank_threshold,
@@ -1260,8 +1314,16 @@ class NewsAnalyzer:
         self._rss_total_count = total
         return rss_stats, rss_new_stats, raw_rss_items, rss_new_urls
 
-    def _convert_rss_items_to_list(self, items_dict: Dict, id_to_name: Dict) -> List[Dict]:
-        """将 RSS 条目字典转换为列表格式，并应用新鲜度过滤（用于推送）"""
+    def _convert_rss_items_to_list(
+        self,
+        items_dict: Dict,
+        id_to_name: Dict,
+        apply_freshness_filter: bool = True,
+    ) -> List[Dict]:
+        """将 RSS 条目字典转换为列表格式。
+
+        新增区域传入 apply_freshness_filter=False，保留所有本次首次检测到的条目。
+        """
         rss_items = []
         filtered_count = 0
         filtered_details = []  # 用于 DEBUG 模式下的详细日志
@@ -1293,7 +1355,7 @@ class NewsAnalyzer:
 
             for item in items:
                 # 应用新鲜度过滤（仅在启用时）
-                if freshness_enabled and max_days > 0:
+                if apply_freshness_filter and freshness_enabled and max_days > 0:
                     if item.published_at and not is_within_days(item.published_at, max_days, timezone):
                         filtered_count += 1
                         # 记录详细信息用于 DEBUG 模式
@@ -1392,6 +1454,7 @@ class NewsAnalyzer:
         rss_new_items: Optional[List[Dict]] = None,
         raw_rss_items: Optional[List[Dict]] = None,
         rss_new_urls: Optional[set] = None,
+        schedule: Optional[ResolvedSchedule] = None,
     ) -> Optional[str]:
         """执行模式特定逻辑，支持热榜+RSS合并推送
 
@@ -1399,27 +1462,13 @@ class NewsAnalyzer:
         - 每次运行都生成 HTML 报告（时间戳快照 + latest/{mode}.html + index.html）
         - 根据模式发送通知
         """
-        # 调度系统
-        scheduler = self.ctx.create_scheduler()
-        schedule = scheduler.resolve()
-
-        # 使用 schedule 决定的 report_mode 覆盖全局配置
-        effective_mode = schedule.report_mode
-        if effective_mode != self.report_mode:
-            print(f"[调度] 报告模式覆盖: {self.report_mode} -> {effective_mode}")
-        self.report_mode = effective_mode
+        if schedule is None:
+            scheduler = self.ctx.create_scheduler()
+            schedule = scheduler.resolve()
+            self._apply_resolved_schedule(schedule)
 
         # 重新获取 mode_strategy，确保 report_type 与覆盖后的 report_mode 一致
         mode_strategy = self._get_mode_strategy()
-
-        # 使用 schedule 决定的 frequency_file 覆盖默认值
-        self.frequency_file = schedule.frequency_file
-
-        # 使用 schedule 决定的筛选策略覆盖默认值
-        self.filter_method = schedule.filter_method or self.ctx.filter_method
-
-        # 使用 schedule 决定的 AI 筛选兴趣文件覆盖默认值
-        self.interests_file = schedule.interests_file
 
         # 如果调度器说不采集，则直接跳过
         if not schedule.collect:
@@ -1451,6 +1500,21 @@ class NewsAnalyzer:
                     _,
                     _,
                 ) = analysis_data
+
+                # 当前榜单模式可用最后成功数据补齐暂时失败的平台。
+                # failed_ids 仍保留，报告会明确显示上游失败。
+                fallback_title_info = self._prepare_current_title_info(results, time_info)
+                for source_id in self._platform_fallback_ids:
+                    if source_id not in results:
+                        continue
+                    all_results[source_id] = results[source_id]
+                    historical_id_to_name[source_id] = id_to_name.get(source_id, source_id)
+                    historical_title_info[source_id] = fallback_title_info.get(source_id, {})
+                if self._platform_fallback_ids:
+                    print(
+                        f"[抓取缓存] 当前榜单已补齐平台: "
+                        f"{self._platform_fallback_ids}"
+                    )
 
                 print(
                     f"current模式：使用过滤后的历史数据，包含平台：{list(all_results.keys())}"
@@ -1551,12 +1615,17 @@ class NewsAnalyzer:
                 )
         else:
             # incremental 模式：只使用当前抓取的数据
-            title_info = self._prepare_current_title_info(results, time_info)
+            incremental_results = {
+                source_id: titles
+                for source_id, titles in results.items()
+                if source_id not in self._platform_fallback_ids
+            }
+            title_info = self._prepare_current_title_info(incremental_results, time_info)
             standalone_data = self._prepare_standalone_data(
-                results, id_to_name, title_info, raw_rss_items
+                incremental_results, id_to_name, title_info, raw_rss_items
             )
             stats, html_file, ai_result, rss_items, standalone_data, rss_new_items = self._run_analysis_pipeline(
-                results,
+                incremental_results,
                 self.report_mode,
                 title_info,
                 new_titles,
@@ -1571,6 +1640,7 @@ class NewsAnalyzer:
                 schedule=schedule,
                 rss_new_urls=rss_new_urls,
             )
+            results = incremental_results
 
         if html_file:
             print(f"HTML报告已生成: {html_file}")
@@ -1606,10 +1676,77 @@ class NewsAnalyzer:
 
         return html_file
 
+    def _write_run_health(
+        self,
+        started_at,
+        duration_seconds: float,
+        status: str,
+        results: Dict,
+        html_file: Optional[str],
+        error: Optional[str],
+    ) -> None:
+        """写入一条可机器检索的运行健康摘要。"""
+        from trendradar.core.run_health import append_run_health
+
+        fresh_item_count = sum(
+            len(titles)
+            for source_id, titles in results.items()
+            if source_id not in self._platform_fallback_ids
+        )
+        record = {
+            "started_at": started_at.isoformat(),
+            "finished_at": self.ctx.get_time().isoformat(),
+            "duration_seconds": round(duration_seconds, 3),
+            "status": status,
+            "mode": self.report_mode,
+            "hotlist": {
+                "source_total": len(self.ctx.platform_ids),
+                "fresh_item_count": fresh_item_count,
+                "failed_ids": self._platform_failed_ids,
+                "fallback_ids": self._platform_fallback_ids,
+            },
+            "rss": {
+                "source_total": self._rss_source_total,
+                "fetched_item_count": self._rss_fetched_count,
+                "failed_ids": self._rss_failed_ids,
+            },
+            "notification": {
+                "attempted": self._notification_attempted,
+                "success": self._notification_success,
+            },
+            "report": html_file,
+            "error": error,
+        }
+
+        try:
+            health_path = append_run_health(record)
+            print(
+                f"[健康摘要] status={status}, "
+                f"hotlist_failed={len(self._platform_failed_ids)}, "
+                f"hotlist_fallback={len(self._platform_fallback_ids)}, "
+                f"rss_failed={len(self._rss_failed_ids)}, "
+                f"notification={self._notification_success}, file={health_path}"
+            )
+        except Exception as health_error:
+            print(f"[健康摘要] 写入失败: {health_error}")
+
     def run(self) -> None:
         """执行分析流程"""
+        started_at = self.ctx.get_time()
+        started_monotonic = time.monotonic()
+        results = {}
+        html_file = None
+        run_error = None
         try:
             if not self._initialize_and_check_config():
+                return
+
+            # 先解析调度，再抓取与处理 RSS，保证从头到尾使用同一模式。
+            scheduler = self.ctx.create_scheduler()
+            schedule = scheduler.resolve()
+            self._apply_resolved_schedule(schedule)
+            if not schedule.collect:
+                print("[调度] 当前时间段不执行数据采集，程序退出")
                 return
 
             mode_strategy = self._get_mode_strategy()
@@ -1621,17 +1758,31 @@ class NewsAnalyzer:
             rss_items, rss_new_items, raw_rss_items, rss_new_urls = self._crawl_rss_data()
 
             # 执行模式策略，传递 RSS 数据用于合并推送
-            self._execute_mode_strategy(
+            html_file = self._execute_mode_strategy(
                 mode_strategy, results, id_to_name, failed_ids,
                 rss_items=rss_items, rss_new_items=rss_new_items,
-                raw_rss_items=raw_rss_items, rss_new_urls=rss_new_urls
+                raw_rss_items=raw_rss_items, rss_new_urls=rss_new_urls,
+                schedule=schedule,
             )
 
         except Exception as e:
+            run_error = f"{type(e).__name__}: {e}"
             print(f"分析流程执行出错: {e}")
-            if self.ctx.config.get("DEBUG", False):
-                raise
+            raise
         finally:
+            status = "failed" if run_error else (
+                "degraded"
+                if self._platform_failed_ids or self._rss_failed_ids
+                else "ok"
+            )
+            self._write_run_health(
+                started_at=started_at,
+                duration_seconds=time.monotonic() - started_monotonic,
+                status=status,
+                results=results,
+                html_file=html_file,
+                error=run_error,
+            )
             # 清理资源（包括过期数据清理和数据库连接关闭）
             self.ctx.cleanup()
 
@@ -1705,10 +1856,12 @@ def main():
         print("  • config/config.yaml")
         print("  • config/frequency_words.txt")
         print("\n参考项目文档进行正确配置")
+        raise SystemExit(1)
     except Exception as e:
         print(f"❌ 程序运行错误: {e}")
         if debug_mode:
             raise
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

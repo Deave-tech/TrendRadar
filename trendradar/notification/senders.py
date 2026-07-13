@@ -227,6 +227,119 @@ def send_to_feishu(
     return True
 
 
+def send_to_feishu_app(
+    app_id: str,
+    app_secret: str,
+    receive_id: str,
+    report_data: Dict,
+    report_type: str,
+    update_info: Optional[Dict] = None,
+    proxy_url: Optional[str] = None,
+    mode: str = "daily",
+    receive_id_type: str = "chat_id",
+    *,
+    batch_size: int = 29000,
+    batch_interval: float = 1.0,
+    split_content_func: Callable = None,
+    get_time_func: Callable = None,
+    rss_items: Optional[list] = None,
+    rss_new_items: Optional[list] = None,
+    ai_analysis: Any = None,
+    display_regions: Optional[Dict] = None,
+    standalone_data: Optional[Dict] = None,
+) -> bool:
+    """使用飞书企业自建应用身份发送消息。"""
+    proxies = None
+    if proxy_url:
+        proxies = {"http": proxy_url, "https": proxy_url}
+
+    try:
+        token_response = requests.post(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            json={"app_id": app_id, "app_secret": app_secret},
+            proxies=proxies,
+            timeout=30,
+        )
+        token_result = token_response.json()
+        if token_response.status_code != 200 or token_result.get("code") != 0:
+            print(
+                "飞书企业应用获取访问凭证失败，"
+                f"状态码：{token_response.status_code}，错误：{token_result.get('msg', '未知错误')}"
+            )
+            return False
+        access_token = token_result.get("tenant_access_token")
+        if not access_token:
+            print("飞书企业应用获取访问凭证失败：响应中缺少 tenant_access_token")
+            return False
+    except Exception as e:
+        print(f"飞书企业应用获取访问凭证出错：{e}")
+        return False
+
+    ai_content = _render_ai_analysis(ai_analysis, "feishu") if ai_analysis else None
+    ai_stats = _extract_ai_stats(ai_analysis)
+    header_reserve = get_max_batch_header_size("feishu")
+    batches = split_content_func(
+        report_data,
+        "feishu",
+        update_info,
+        max_bytes=batch_size - header_reserve,
+        mode=mode,
+        rss_items=rss_items,
+        rss_new_items=rss_new_items,
+        ai_content=ai_content,
+        standalone_data=standalone_data,
+        ai_stats=ai_stats,
+        report_type=report_type,
+    )
+    batches = add_batch_headers(batches, "feishu", batch_size)
+    print(f"飞书企业应用消息分为 {len(batches)} 批次发送 [{report_type}]")
+
+    message_url = (
+        "https://open.feishu.cn/open-apis/im/v1/messages"
+        f"?receive_id_type={receive_id_type}"
+    )
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
+    for i, batch_content in enumerate(batches, 1):
+        card = {
+            "schema": "2.0",
+            "body": {"elements": [{"tag": "markdown", "content": batch_content}]},
+        }
+        payload = {
+            "receive_id": receive_id,
+            "msg_type": "interactive",
+            "content": json.dumps(card, ensure_ascii=False),
+        }
+        try:
+            response = requests.post(
+                message_url,
+                headers=headers,
+                json=payload,
+                proxies=proxies,
+                timeout=30,
+            )
+            result = response.json()
+            if response.status_code != 200 or result.get("code") != 0:
+                print(
+                    f"飞书企业应用第 {i}/{len(batches)} 批次发送失败 "
+                    f"[{report_type}]，状态码：{response.status_code}，"
+                    f"错误：{result.get('msg', '未知错误')}"
+                )
+                return False
+            print(f"飞书企业应用第 {i}/{len(batches)} 批次发送成功 [{report_type}]")
+            if i < len(batches):
+                time.sleep(batch_interval)
+        except Exception as e:
+            print(f"飞书企业应用第 {i}/{len(batches)} 批次发送出错 [{report_type}]：{e}")
+            return False
+
+    return True
+
+
 def send_to_dingtalk(
     webhook_url: str,
     report_data: Dict,

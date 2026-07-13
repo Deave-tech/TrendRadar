@@ -7,7 +7,7 @@ SQLite 存储 Mixin
 
 import sqlite3
 from abc import abstractmethod
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1058,27 +1058,46 @@ class SQLiteStorageMixin:
             # 获取历史数据
             historical_data = self._get_rss_data_impl(current_data.date)
 
-            if not historical_data:
-                # 没有历史数据，所有都是新的
-                return current_data.items.copy()
-
             # 获取当前批次时间
             current_time = current_data.crawl_time
 
             # 收集历史 URL（first_time < current_time 的条目）
             historical_urls: Dict[str, set] = {}
-            for feed_id, rss_list in historical_data.items.items():
-                historical_urls[feed_id] = set()
-                for item in rss_list:
-                    first_time = item.first_time or item.crawl_time
-                    if first_time < current_time:
-                        if item.url:
-                            historical_urls[feed_id].add(item.url)
+            if historical_data:
+                for feed_id, rss_list in historical_data.items.items():
+                    historical_urls[feed_id] = set()
+                    for item in rss_list:
+                        first_time = item.first_time or item.crawl_time
+                        if first_time < current_time:
+                            if item.url:
+                                historical_urls[feed_id].add(item.url)
+
+            # 跨日去重：当天首批与前一天已见 URL 比较，
+            # 避免日切时重新推送整个 RSS 列表。
+            try:
+                current_date = datetime.strptime(current_data.date, "%Y-%m-%d")
+                previous_date = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+                previous_data = None
+                previous_path = self._get_db_path(previous_date, db_type="rss")
+                if previous_path.exists():
+                    previous_data = self._get_rss_data_impl(previous_date)
+                if previous_data and previous_data.items:
+                    previous_count = 0
+                    for feed_id, rss_list in previous_data.items.items():
+                        feed_history = historical_urls.setdefault(feed_id, set())
+                        for item in rss_list:
+                            if item.url:
+                                feed_history.add(item.url)
+                                previous_count += 1
+                    if previous_count:
+                        print(f"[存储] RSS 跨日去重基线：读取前一天 {previous_count} 条 URL")
+            except (TypeError, ValueError):
+                pass
 
             # 检查是否有早于当前批次的历史数据
             has_historical_data = any(len(urls) > 0 for urls in historical_urls.values())
             if not has_historical_data:
-                # 当天第一次抓取，所有条目都是新增
+                # 当天与前一天都没有历史，所有条目都是新增
                 return current_data.items.copy()
 
             # 检测新增

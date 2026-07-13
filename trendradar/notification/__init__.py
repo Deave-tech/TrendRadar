@@ -36,6 +36,7 @@ from trendradar.notification.splitter import (
 )
 from trendradar.notification.senders import (
     send_to_feishu,
+    send_to_feishu_app,
     send_to_dingtalk,
     send_to_wework,
     send_to_telegram,
@@ -64,6 +65,7 @@ __all__ = [
     "DEFAULT_BATCH_SIZES",
     # 消息发送器
     "send_to_feishu",
+    "send_to_feishu_app",
     "send_to_dingtalk",
     "send_to_wework",
     "send_to_telegram",

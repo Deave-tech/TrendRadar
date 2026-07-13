@@ -411,6 +411,10 @@ def _load_webhook_config(config_data: Dict) -> Dict:
     return {
         # 飞书
         "FEISHU_WEBHOOK_URL": _get_env_str("FEISHU_WEBHOOK_URL") or feishu.get("webhook_url", ""),
+        "FEISHU_APP_ID": _get_env_str("FEISHU_APP_ID") or feishu.get("app_id", ""),
+        "FEISHU_APP_SECRET": _get_env_str("FEISHU_APP_SECRET") or feishu.get("app_secret", ""),
+        "FEISHU_RECEIVE_ID": _get_env_str("FEISHU_RECEIVE_ID") or feishu.get("receive_id", ""),
+        "FEISHU_RECEIVE_ID_TYPE": _get_env_str("FEISHU_RECEIVE_ID_TYPE") or feishu.get("receive_id_type", "chat_id"),
         # 钉钉
         "DINGTALK_WEBHOOK_URL": _get_env_str("DINGTALK_WEBHOOK_URL") or dingtalk.get("webhook_url", ""),
         # 企业微信
@@ -449,6 +453,12 @@ def _print_notification_sources(config: Dict) -> None:
         count = min(len(accounts), max_accounts)
         source = "环境变量" if os.environ.get("FEISHU_WEBHOOK_URL") else "配置文件"
         notification_sources.append(f"飞书({source}, {count}个账号)")
+    elif all(
+        config.get(key)
+        for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_RECEIVE_ID")
+    ):
+        source = "环境变量" if os.environ.get("FEISHU_APP_ID") else "配置文件"
+        notification_sources.append(f"飞书企业应用({source})")
 
     if config["DINGTALK_WEBHOOK_URL"]:
         accounts = parse_multi_account_config(config["DINGTALK_WEBHOOK_URL"])

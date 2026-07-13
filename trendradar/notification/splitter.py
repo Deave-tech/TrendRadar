@@ -933,7 +933,16 @@ def split_content_into_batches(
         if region_produced_content:
             has_region_content = True
 
-    if report_data["failed_ids"]:
+    # In "new items only" mode, do not append failed source diagnostics to the
+    # notification body. Otherwise a transient source failure (for example
+    # "baidu") appears as a confusing trailing leftover even though the user
+    # requested only newly-added items.
+    show_failed_sources = any(
+        region in region_order
+        for region in ("hotlist", "rss", "standalone", "ai_analysis")
+    )
+
+    if show_failed_sources and report_data["failed_ids"]:
         failed_header = ""
         if format_type == "wework":
             failed_header = f"\n\n\n\n⚠️ **数据获取失败的平台：**\n\n"

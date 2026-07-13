@@ -9,6 +9,7 @@
 Author: TrendRadar Team
 """
 
+from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 
 
@@ -167,12 +168,30 @@ def detect_latest_new_titles_from_storage(
                 if first_time < latest_time:
                     historical_titles[source_id].add(item.title)
 
-        # 检查是否是当天第一次抓取（没有任何历史标题）
-        # 如果所有平台的历史标题集合都为空，说明只有一个抓取批次
-        # 在这种情况下，将所有最新批次的标题视为"新增"（用于增量模式的第一次推送）
+        # 跨日去重：当天首批也与前一天已见标题比较，
+        # 避免每天 00:00 把仍在榜的旧内容重新当成新增。
+        try:
+            current_date = datetime.strptime(latest_data.date, "%Y-%m-%d")
+            previous_date = (current_date - timedelta(days=1)).strftime("%Y-%m-%d")
+            previous_data = storage_manager.get_today_all_data(previous_date)
+            if previous_data and previous_data.items:
+                previous_count = 0
+                for source_id, news_list in previous_data.items.items():
+                    if current_platform_ids is not None and source_id not in current_platform_ids:
+                        continue
+                    source_history = historical_titles.setdefault(source_id, set())
+                    for item in news_list:
+                        source_history.add(item.title)
+                        previous_count += 1
+                if previous_count:
+                    print(f"[存储] 跨日去重基线：读取前一天 {previous_count} 条标题")
+        except (TypeError, ValueError):
+            pass
+
+        # 如果当天与前一天都没有历史，才将当前批次视为全部新增。
         has_historical_data = any(len(titles) > 0 for titles in historical_titles.values())
         if not has_historical_data:
-            # 第一次爬取：返回所有最新标题作为"新增"
+            # 首次抓取：返回所有最新标题作为"新增"
             return latest_titles
 
         # 步骤3：找出新增标题 = 最新批次标题 - 历史标题

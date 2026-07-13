@@ -1129,6 +1129,17 @@ def run_server(
         host: HTTP模式的监听地址，默认 0.0.0.0
         port: HTTP模式的监听端口，默认 3333
     """
+    import builtins
+    import sys
+
+    # In stdio MCP mode stdout is the protocol stream. Keep startup diagnostics
+    # off stdout so MCP clients such as OpenClaw can complete the handshake.
+    log_stream = sys.stderr if transport == 'stdio' else sys.stdout
+
+    def print(*args, **kwargs):
+        kwargs.setdefault('file', log_stream)
+        return builtins.print(*args, **kwargs)
+
     # 初始化工具实例
     _get_tools(project_root)
 

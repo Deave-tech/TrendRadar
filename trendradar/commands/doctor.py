@@ -215,6 +215,16 @@ def _check_notification_channels(results: List[Tuple[str, str, str]], config: Di
         if values:
             channel_details.append(f"{name}({min(len(values), max_accounts)}个)")
 
+    feishu_app_values = [
+        config.get("FEISHU_APP_ID"),
+        config.get("FEISHU_APP_SECRET"),
+        config.get("FEISHU_RECEIVE_ID"),
+    ]
+    if all(feishu_app_values):
+        channel_details.append("飞书企业应用")
+    elif any(feishu_app_values):
+        channel_issues.append("飞书企业应用配置不完整（需要 app_id/app_secret/receive_id）")
+
     tg_tokens = parse_multi_account_config(config.get("TELEGRAM_BOT_TOKEN", ""))
     tg_chats = parse_multi_account_config(config.get("TELEGRAM_CHAT_ID", ""))
     if tg_tokens or tg_chats:
