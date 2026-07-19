@@ -141,6 +141,14 @@ rss:
       name: "雅虎财经"
       url: "https://finance.yahoo.com/news/rssindex"
 
+    # WSJ list discovery is stored normally, while link notifications are
+    # suppressed because the delivery worker sends Feishu Docx links instead.
+    - id: "wsj-cn"
+      name: "华尔街日报中文网"
+      url: "http://127.0.0.1:4555/wsj-cn.xml"
+      max_age_days: 0
+      notify: false
+
     # 自定义源示例
     # - id: "custom-feed"
     #   name: "自定义源"

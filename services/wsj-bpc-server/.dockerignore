@@ -1,0 +1,8 @@
+node_modules/
+.profile/
+.env
+.env.*
+.cookies.json
+.cookies.json.*
+*.log
+npm-debug.log*

@@ -1033,6 +1033,7 @@ class NewsAnalyzer:
                     max_items=feed_config.get("max_items", 50),
                     enabled=feed_config.get("enabled", True),
                     max_age_days=max_age_days,  # None=使用全局，0=禁用，>0=覆盖
+                    notify=feed_config.get("notify", True),
                 )
                 if feed.id and feed.url and feed.enabled:
                     feeds.append(feed)
@@ -1107,6 +1108,10 @@ class NewsAnalyzer:
             - rss_new_urls: 原始新增 RSS 条目的 URL 集合（未经关键词过滤，用于 AI 模式 is_new 检测）
         """
         from trendradar.core.analyzer import count_rss_frequency
+        from trendradar.crawler.rss import filter_notification_items
+
+        def notification_items(items):
+            return filter_notification_items(items, self.ctx.rss_feeds)
 
         # 从 display.regions.rss 统一控制 RSS 分析和展示
         rss_display_enabled = self.ctx.config.get("DISPLAY", {}).get("REGIONS", {}).get("RSS", True)
@@ -1130,16 +1135,21 @@ class NewsAnalyzer:
         # 根据模式获取原始条目
         if self.report_mode == "incremental":
             new_items_dict = self.storage_manager.detect_new_rss_items(rss_data)
+            new_items_dict = notification_items(new_items_dict)
             if new_items_dict:
                 raw_rss_items = self._convert_rss_items_to_list(new_items_dict, rss_data.id_to_name)
         elif self.report_mode == "current":
             latest_data = self.storage_manager.get_latest_rss_data(rss_data.date)
             if latest_data:
-                raw_rss_items = self._convert_rss_items_to_list(latest_data.items, latest_data.id_to_name)
+                raw_rss_items = self._convert_rss_items_to_list(
+                    notification_items(latest_data.items), latest_data.id_to_name
+                )
         else:  # daily
             all_data = self.storage_manager.get_rss_data(rss_data.date)
             if all_data:
-                raw_rss_items = self._convert_rss_items_to_list(all_data.items, all_data.id_to_name)
+                raw_rss_items = self._convert_rss_items_to_list(
+                    notification_items(all_data.items), all_data.id_to_name
+                )
 
         # 如果 RSS 展示未启用，跳过关键词分析，只返回原始条目用于独立展示区
         if not rss_display_enabled:
@@ -1147,6 +1157,7 @@ class NewsAnalyzer:
 
         # 2. 获取新增条目（用于统计）
         new_items_dict = self.storage_manager.detect_new_rss_items(rss_data)
+        new_items_dict = notification_items(new_items_dict)
         new_items_list = None
         if new_items_dict:
             new_items_list = self._convert_rss_items_to_list(new_items_dict, rss_data.id_to_name)
@@ -1647,6 +1658,9 @@ def main():
 诊断命令:
   --doctor               运行环境与配置体检
   --test-notification    发送测试通知到已配置渠道
+WSJ 云文档投递:
+  --wsj-delivery         运行一次独立的 WSJ 全文投递
+  --backfill-current     首次显式初始化并回补当前 feed（可配合 --drain）
 
 示例:
   python -m trendradar                    # 正常运行
@@ -1658,11 +1672,32 @@ def main():
     parser.add_argument("--show-schedule", action="store_true", help="显示当前调度状态")
     parser.add_argument("--doctor", action="store_true", help="运行环境与配置体检")
     parser.add_argument("--test-notification", action="store_true", help="发送测试通知到已配置渠道")
+    parser.add_argument("--wsj-delivery", action="store_true", help="运行一次 WSJ 全文云文档投递")
+    parser.add_argument(
+        "--backfill-current", action="store_true", help="首次初始化并处理当前 WSJ feed"
+    )
+    parser.add_argument(
+        "--drain", action="store_true", help="持续处理 WSJ outbox，直到无立即可运行项或达到时限"
+    )
 
     args = parser.parse_args()
 
+    if (args.backfill_current or args.drain) and not args.wsj_delivery:
+        parser.error("--backfill-current/--drain 只能与 --wsj-delivery 一起使用")
+
     debug_mode = False
     try:
+        if args.wsj_delivery:
+            from trendradar.wsj_delivery import run_cli
+
+            exit_code = run_cli(
+                backfill_current=args.backfill_current,
+                drain=args.drain,
+            )
+            if exit_code:
+                raise SystemExit(exit_code)
+            return
+
         if args.doctor:
             ok = run_doctor()
             if not ok:

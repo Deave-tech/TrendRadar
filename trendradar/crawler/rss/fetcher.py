@@ -26,6 +26,7 @@ class RSSFeedConfig:
     max_items: int = 0          # 最大条目数（0=不限制）
     enabled: bool = True        # 是否启用
     max_age_days: Optional[int] = None  # 文章最大年龄（天），覆盖全局设置；None=使用全局，0=禁用过滤
+    notify: bool = True         # 是否进入普通报告/通知；False 时仍抓取并存储
 
 
 class RSSFetcher:
@@ -247,6 +248,7 @@ class RSSFetcher:
                 max_items=feed_config.get("max_items", 0),  # 0=不限制
                 enabled=feed_config.get("enabled", True),
                 max_age_days=max_age_days,  # None=使用全局，0=禁用，>0=覆盖
+                notify=feed_config.get("notify", True),
             )
             if feed.id and feed.url:
                 feeds.append(feed)
@@ -261,3 +263,21 @@ class RSSFetcher:
             freshness_enabled=freshness_enabled,
             default_max_age_days=default_max_age_days,
         )
+
+
+def filter_notification_items(
+    items: Dict[str, List], feed_configs: List[Dict]
+) -> Dict[str, List]:
+    """Remove feeds marked ``notify: false`` from presentation data only.
+
+    The caller invokes this after ``save_rss_data`` so suppressed sources remain
+    in SQLite and continue participating in crawl health/history.
+    """
+    suppressed = {
+        str(feed.get("id", ""))
+        for feed in feed_configs
+        if feed.get("notify", True) is False
+    }
+    if not suppressed:
+        return items
+    return {feed_id: values for feed_id, values in items.items() if feed_id not in suppressed}

@@ -1,0 +1,11 @@
+[Unit]
+Description=Deliver new WSJ articles to Feishu hourly at minute 10
+
+[Timer]
+OnCalendar=*-*-* *:10:00
+AccuracySec=1min
+Persistent=true
+Unit=trendradar-wsj-delivery.service
+
+[Install]
+WantedBy=timers.target

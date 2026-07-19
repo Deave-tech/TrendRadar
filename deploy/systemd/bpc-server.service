@@ -1,0 +1,29 @@
+[Unit]
+Description=TrendRadar WSJ BPC article fetch API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/TrendRadar/services/wsj-bpc-server
+Environment=HOME=/home/ubuntu
+Environment=NODE_ENV=production
+Environment=REQUIRE_API_TOKEN=1
+Environment=ENABLE_LEGACY_FETCH=0
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+Environment=BPC_DIR=/home/ubuntu/bpc
+Environment=PROFILE_DIR=/var/lib/trendradar/bpc-profile
+Environment=COOKIES_FILE=/var/lib/trendradar/bpc-cookies.json
+EnvironmentFile=/etc/trendradar/bpc-server.env
+StateDirectory=trendradar
+UMask=0077
+ExecStart=/usr/bin/env node /home/ubuntu/TrendRadar/services/wsj-bpc-server/index.mjs
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=2min
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

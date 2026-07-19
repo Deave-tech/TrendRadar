@@ -6,6 +6,6 @@ RSS 抓取模块
 """
 
 from .parser import RSSParser
-from .fetcher import RSSFetcher, RSSFeedConfig
+from .fetcher import RSSFetcher, RSSFeedConfig, filter_notification_items
 
-__all__ = ["RSSParser", "RSSFetcher", "RSSFeedConfig"]
+__all__ = ["RSSParser", "RSSFetcher", "RSSFeedConfig", "filter_notification_items"]
