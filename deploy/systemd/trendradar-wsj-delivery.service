@@ -1,0 +1,18 @@
+[Unit]
+Description=Deliver new WSJ articles to Feishu Docx
+After=network-online.target bpc-server.service wsj-cn-rss-bridge.service
+Wants=network-online.target bpc-server.service wsj-cn-rss-bridge.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/TrendRadar
+Environment=HOME=/home/ubuntu
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/trendradar/wsj-delivery.env
+StateDirectory=trendradar
+UMask=0077
+ExecStart=/home/ubuntu/.local/bin/uv run python -m trendradar --wsj-delivery
+SuccessExitStatus=75
+TimeoutStartSec=30min

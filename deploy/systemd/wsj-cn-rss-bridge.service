@@ -1,0 +1,22 @@
+[Unit]
+Description=WSJ Chinese RSS bridge for TrendRadar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/TrendRadar
+Environment=HOME=/home/ubuntu
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/trendradar/wsj-bridge.env
+StateDirectory=trendradar
+UMask=0077
+ExecStart=/usr/bin/python3 /home/ubuntu/TrendRadar/scripts/wsj_cn_rss_bridge.py --host 127.0.0.1 --port 4555 --ttl 900 --snapshot /var/lib/trendradar/wsj-cn-rss-bridge.json --fetch-timeout 15 --max-workers 4 --max-items 80 --stale-after 3600
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=2min
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

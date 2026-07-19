@@ -37,6 +37,11 @@ class AIFilterPipeline:
         rss_config = config.get("RSS", {})
         self._rss_enabled = rss_config.get("ENABLED", False)
         self._rss_feeds = rss_config.get("FEEDS", [])
+        self._suppressed_rss_feed_ids = {
+            str(feed.get("id", ""))
+            for feed in self._rss_feeds
+            if feed.get("notify", True) is False
+        }
 
         freshness_config = rss_config.get("FRESHNESS_FILTER", {})
         self._freshness_enabled = freshness_config.get("ENABLED", True)
@@ -290,6 +295,8 @@ class AIFilterPipeline:
             for n in all_rss:
                 published_at = n.get("published_at", "")
                 feed_id = n.get("source_id", "")
+                if feed_id in self._suppressed_rss_feed_ids:
+                    continue
                 max_days = self._feed_max_age_map.get(feed_id, self._default_max_age_days)
                 if self._freshness_enabled and max_days > 0 and published_at:
                     if not is_within_days(published_at, max_days, self._timezone):
@@ -511,6 +518,11 @@ class AIFilterPipeline:
 
             for item in items:
                 source_type = item.get("source_type", "hotlist")
+                if (
+                    source_type == "rss"
+                    and item.get("source_id", "") in self._suppressed_rss_feed_ids
+                ):
+                    continue
 
                 if mode == "current" and latest_time and source_type == "hotlist":
                     if item.get("last_time", "") != latest_time:
