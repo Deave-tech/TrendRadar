@@ -161,3 +161,66 @@ test('DOM extraction keeps only ordered images associated with article paragraph
     await browser.close();
   }
 });
+
+test('DOM extraction interleaves WSJ photo-essay headings after each image', { timeout: 20000 }, async () => {
+  const browser = await chromium.launch({ channel: 'chromium', headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`
+      <!doctype html><html><head>
+        <base href="https://cn.wsj.com/articles/photo-essay">
+      </head><body><article><section>
+        <p>${'Introductory paragraph one. '.repeat(8)}</p>
+        <p>${'Introductory paragraph two. '.repeat(8)}</p>
+        <p>${'Introductory paragraph three. '.repeat(8)}</p>
+        <div class="paywall css-PaywalledContentContainer">
+          <div class="media-layout"><figure>
+            <img src="https://images.wsj.net/im-photo-one" width="1200" height="800" alt="photo one">
+          </figure></div>
+          <h3>Profile one</h3>
+          <h4>Occupation: Writer</h4>
+          <h4>Typical use: Every day</h4>
+          <div class="media-layout"><figure>
+            <img src="https://images.wsj.net/im-photo-two" width="1200" height="800" alt="photo two">
+          </figure></div>
+          <h3>Profile two</h3>
+          <h4>Occupation: Artist</h4>
+          <h4>Typical use: While travelling</h4>
+          <h3>Unrelated plain heading</h3>
+          <h3><a href="https://cn.wsj.com/articles/another-story">Related story</a></h3>
+          <div data-component="RecommendedStories">
+            <h3>Recommended profile</h3>
+            <h4>Recommended detail one</h4>
+            <h4>Recommended detail two</h4>
+          </div>
+        </div>
+      </section></article></body></html>
+    `);
+
+    const snapshot = await readWsjSnapshot(page);
+    assert.deepEqual(snapshot.paragraphs.slice(3), [
+      'Profile one',
+      'Occupation: Writer',
+      'Typical use: Every day',
+      'Profile two',
+      'Occupation: Artist',
+      'Typical use: While travelling',
+    ]);
+    assert.equal(snapshot.paragraphs.includes('Unrelated plain heading'), false);
+    assert.equal(snapshot.paragraphs.includes('Related story'), false);
+    assert.equal(snapshot.paragraphs.includes('Recommended profile'), false);
+
+    const images = sanitizeWsjImages(
+      snapshot.imageCandidates,
+      'https://cn.wsj.com/articles/photo-essay',
+      snapshot.paragraphs.length,
+      snapshot.trustedImageMetadata
+    );
+    assert.deepEqual(images.map((item) => ({ url: item.url, afterParagraph: item.afterParagraph })), [
+      { url: 'https://images.wsj.net/im-photo-one', afterParagraph: 2 },
+      { url: 'https://images.wsj.net/im-photo-two', afterParagraph: 5 },
+    ]);
+  } finally {
+    await browser.close();
+  }
+});

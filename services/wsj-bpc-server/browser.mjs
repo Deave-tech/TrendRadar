@@ -234,6 +234,32 @@ export async function readWsjSnapshot(page) {
       return false;
     };
     const paragraphSelector = 'p, [data-type="paragraph"], div[style*="font-family"]';
+    const articleHeadingSelector = 'h3, h4';
+    const photoEssayHeadings = new Set();
+    if (article) {
+      for (const container of article.querySelectorAll(
+        '.paywall, [class*="PaywalledContentContainer"]'
+      )) {
+        const children = Array.from(container.children);
+        for (let index = 1; index + 2 < children.length; index++) {
+          const media = children[index - 1];
+          const group = children.slice(index, index + 3);
+          if (!group[0].matches('h3') || !group[1].matches('h4') || !group[2].matches('h4')) continue;
+          if (media.querySelectorAll('img').length !== 1 ||
+            !media.querySelector('figure img, picture img') ||
+            !/(^| )(media|image|photo|photograph|photography|figure)( |$)/.test(structuralMarker(media)) ||
+            media.querySelector('a[href], h1, h2, h3, h4, h5, h6, button, [role="button"]') ||
+            excludedContentContext(media)) continue;
+          if (group.some((elem) => !visible(elem) || excludedContentContext(elem) ||
+            elem.querySelector('a[href], img, picture, figure, button, [role="button"]'))) continue;
+          // WSJ photo essays render the text belonging to a photograph as a
+          // strict H3/H4/H4 trio immediately after its single-image media
+          // block. Trust only that narrow publisher-owned sequence so generic
+          // article/recommendation headings never enter正文 extraction.
+          group.forEach((elem) => photoEssayHeadings.add(elem));
+        }
+      }
+    }
     const paragraphs = [];
     const paragraphElements = [];
     const seen = new Set();
@@ -245,8 +271,11 @@ export async function readWsjSnapshot(page) {
         paragraphs.push(text);
         if (elem) paragraphElements.push(elem);
       };
-      const candidates = Array.from(article.querySelectorAll(paragraphSelector));
+      const candidates = Array.from(article.querySelectorAll(
+        `${paragraphSelector}, ${articleHeadingSelector}`
+      ));
       for (const elem of candidates) {
+        if (elem.matches(articleHeadingSelector) && !photoEssayHeadings.has(elem)) continue;
         // Keep the deepest matching element to avoid duplicating nested text.
         if (elem.querySelector(paragraphSelector)) continue;
         if (elem.closest('aside, figure, nav, footer, [role="complementary"], [role="navigation"], .wsj-ad, .adWrapper')) continue;
