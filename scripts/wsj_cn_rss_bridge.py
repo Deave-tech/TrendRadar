@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Local RSS bridge for public WSJ Chinese listing pages.
+"""Local RSS bridge for WSJ Chinese listing pages fetched through BPC.
 
 The HTTP handlers only serve the most recent in-memory snapshot.  Listing pages are
-refreshed by a background worker so a slow WSJ response never stalls RSS clients.
+refreshed by a background worker so a slow BPC/WSJ response never stalls RSS clients.
 """
 
 from __future__ import annotations
@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import email.utils
+import hashlib
 import html
 import json
 import os
@@ -42,12 +43,10 @@ DEFAULT_SOURCES = [
     "https://cn.wsj.com/zh-hans/news/opinion",
 ]
 
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; LocalWsjCnRssBridge/2.0; "
-    "+https://cn.wsj.com/)"
-)
+DEFAULT_BPC_BASE_URL = "http://127.0.0.1:8080"
+BPC_LIST_MAX_RESPONSE_BYTES = 12 * 1024 * 1024
 DEFAULT_MAX_ITEMS = 80
-DEFAULT_MAX_WORKERS = 4
+DEFAULT_MAX_WORKERS = 1
 SNAPSHOT_VERSION = 1
 
 
@@ -64,6 +63,19 @@ class FetchBatch:
     items: list[FeedItem]
     successful_sources: list[str]
     failed_sources: dict[str, str]
+
+
+class BpcListError(RuntimeError):
+    """Safe, non-secret error surfaced by the strict BPC listing API."""
+
+    def __init__(self, status: int, code: str, retryable: bool) -> None:
+        self.status = int(status)
+        self.code = str(code or "INVALID_RESPONSE")[:80]
+        self.retryable = bool(retryable)
+        super().__init__(
+            f"BPC list failed: HTTP {self.status} {self.code} "
+            f"(retryable={str(self.retryable).lower()})"
+        )
 
 
 class BridgeState:
@@ -362,7 +374,7 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
 
 
 def _is_trusted_wsj_https_url(url: str) -> bool:
-    """Return true only for the exact origin allowed to receive WSJ cookies."""
+    """Return true only for the exact origin allowed in BPC list responses."""
     parsed = urllib.parse.urlparse(url)
     return (
         parsed.scheme.lower() == "https"
@@ -370,26 +382,50 @@ def _is_trusted_wsj_https_url(url: str) -> bool:
     )
 
 
-def _request_headers(url: str) -> dict[str, str]:
-    user_agent = os.environ.get("WSJ_CN_USER_AGENT", "").strip() or USER_AGENT
-    headers = {
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "User-Agent": user_agent,
-    }
-    datadome_token = os.environ.get("WSJ_CN_DATADOME_COOKIE", "").strip()
-    if datadome_token:
-        if any(character in datadome_token for character in ("\r", "\n", ";")):
-            raise ValueError(
-                "WSJ_CN_DATADOME_COOKIE must contain only the cookie token value"
-            )
-        if _is_trusted_wsj_https_url(url):
-            headers["Cookie"] = f"datadome={datadome_token}"
-    return headers
+def _bpc_list_endpoint() -> str:
+    """Build a loopback-only endpoint so the bearer token cannot leave the host."""
+    configured = os.environ.get("BPC_BASE_URL", DEFAULT_BPC_BASE_URL).strip()
+    try:
+        parsed = urllib.parse.urlparse(configured)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("BPC_BASE_URL must be a valid loopback URL") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or (parsed.hostname or "").lower() not in {"127.0.0.1", "::1", "localhost"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.rstrip("/")
+    ):
+        raise ValueError("BPC_BASE_URL must be an origin on the loopback interface")
+    netloc = f"[{parsed.hostname}]:{port}" if ":" in (parsed.hostname or "") and port else parsed.netloc
+    return urllib.parse.urlunparse((parsed.scheme.lower(), netloc, "/v1/list", "", "", ""))
 
 
-class WsjSessionRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """Follow redirects without forwarding the WSJ session across origins."""
+def _bpc_api_token() -> str:
+    token = os.environ.get("BPC_API_TOKEN", "").strip()
+    if not token:
+        raise ValueError("BPC_API_TOKEN is required")
+    if any(ord(character) < 0x21 or ord(character) > 0x7E for character in token):
+        raise ValueError("BPC_API_TOKEN must contain only visible ASCII characters")
+    return token
+
+
+def validate_bpc_config() -> None:
+    """Fail before serving when the authenticated loopback dependency is invalid."""
+    _bpc_list_endpoint()
+    _bpc_api_token()
+
+
+def _new_list_request_id(source: str) -> str:
+    source_key = hashlib.sha256(source.encode("utf-8")).hexdigest()[:12]
+    return f"wsj-list:{time.time_ns()}:{source_key}"
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never forward the BPC bearer token through an HTTP redirect."""
 
     def redirect_request(
         self,
@@ -399,22 +435,83 @@ class WsjSessionRedirectHandler(urllib.request.HTTPRedirectHandler):
         msg: str,
         headers: object,
         newurl: str,
-    ) -> urllib.request.Request | None:
-        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if redirected is not None and not _is_trusted_wsj_https_url(newurl):
-            redirected.remove_header("Cookie")
-        return redirected
+    ) -> None:
+        return None
+
+
+def _read_json_response(response: object) -> dict[str, object]:
+    raw = response.read(BPC_LIST_MAX_RESPONSE_BYTES + 1)
+    if len(raw) > BPC_LIST_MAX_RESPONSE_BYTES:
+        raise ValueError("BPC list response is too large")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("BPC list response is not valid UTF-8 JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("BPC list response must be a JSON object")
+    return payload
 
 
 def fetch_url(url: str, timeout: int) -> str:
-    req = urllib.request.Request(
-        url,
-        headers=_request_headers(url),
+    """Fetch one allowlisted listing through the local, authenticated BPC API."""
+    endpoint = _bpc_list_endpoint()
+    token = _bpc_api_token()
+    request_id = _new_list_request_id(url)
+    body = json.dumps(
+        {"url": url, "requestId": request_id},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        endpoint,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
     )
-    opener = urllib.request.build_opener(WsjSessionRedirectHandler())
-    with opener.open(req, timeout=timeout) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        return resp.read().decode(charset, errors="replace")
+    # Ignore HTTP(S)_PROXY for the loopback dependency and reject redirects.
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirectHandler(),
+    )
+    try:
+        response = opener.open(request, timeout=max(1, int(timeout)))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = _read_json_response(exc)
+        except (OSError, ValueError):
+            payload = {}
+        raise BpcListError(
+            exc.code,
+            str(payload.get("code") or f"HTTP_{exc.code}"),
+            bool(payload.get("retryable")) or exc.code in {429, 502, 503},
+        ) from exc
+
+    with response:
+        payload = _read_json_response(response)
+    if payload.get("ok") is not True:
+        raise BpcListError(
+            200,
+            str(payload.get("code") or "INVALID_RESPONSE"),
+            bool(payload.get("retryable")),
+        )
+    if payload.get("requestId") != request_id:
+        raise ValueError("BPC list response requestId does not match")
+    listing = payload.get("list")
+    if not isinstance(listing, dict):
+        raise ValueError("BPC list response is missing list")
+    if listing.get("status") not in {200, "200"}:
+        raise ValueError("BPC list upstream status is not 200")
+    final_url = str(listing.get("canonicalUrl") or listing.get("url") or "")
+    if not _is_trusted_wsj_https_url(final_url):
+        raise ValueError("BPC list response contains an untrusted final URL")
+    page = listing.get("html")
+    if not isinstance(page, str):
+        raise ValueError("BPC list response is missing HTML")
+    return page
 
 
 def fetch_all(
@@ -817,6 +914,7 @@ def main() -> None:
     parser.add_argument("--max-items", type=int, default=DEFAULT_MAX_ITEMS)
     parser.add_argument("--stale-after", type=int)
     args = parser.parse_args()
+    validate_bpc_config()
 
     state = BridgeState(
         args.sources or DEFAULT_SOURCES,

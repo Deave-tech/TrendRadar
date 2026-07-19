@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
@@ -87,64 +88,157 @@ class UrlFilteringTests(unittest.TestCase):
         self.assertIn("article-metadata", items[0].link)
 
 
-class RequestHeaderTests(unittest.TestCase):
-    def test_optional_user_agent_and_datadome_token_are_used_for_wsj_https(self):
-        with mock.patch.dict(
-            BRIDGE.os.environ,
-            {
-                "WSJ_CN_USER_AGENT": "Configured browser user agent",
-                "WSJ_CN_DATADOME_COOKIE": "opaque-token-value",
-            },
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = json.dumps(payload).encode("utf-8")
+
+    def read(self, size=-1):
+        return self.payload if size < 0 else self.payload[:size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+class BpcListClientTests(unittest.TestCase):
+    source = "https://cn.wsj.com/zh-hans/news/china"
+    request_id = "wsj-list:unit-test"
+
+    def _success(self, **overrides):
+        listing = {
+            "url": self.source,
+            "canonicalUrl": self.source,
+            "status": 200,
+            "html": '<a href="/articles/story-12345678">A valid article title</a>',
+            "fetchedAt": "2026-07-20T00:00:00Z",
+        }
+        listing.update(overrides)
+        return {
+            "ok": True,
+            "code": "OK",
+            "retryable": False,
+            "requestId": self.request_id,
+            "list": listing,
+        }
+
+    def test_posts_authenticated_json_to_loopback_bpc(self):
+        opener = mock.Mock()
+        opener.open.return_value = FakeResponse(self._success())
+        with (
+            mock.patch.dict(
+                BRIDGE.os.environ,
+                {
+                    "BPC_BASE_URL": "http://127.0.0.1:8080",
+                    "BPC_API_TOKEN": "test-token",
+                },
+                clear=True,
+            ),
+            mock.patch.object(BRIDGE, "_new_list_request_id", return_value=self.request_id),
+            mock.patch.object(BRIDGE.urllib.request, "build_opener", return_value=opener),
         ):
-            headers = BRIDGE._request_headers("https://cn.wsj.com/zh-hans/news/china")
+            page = BRIDGE.fetch_url(self.source, timeout=120)
 
-        self.assertEqual("Configured browser user agent", headers["User-Agent"])
-        self.assertEqual("datadome=opaque-token-value", headers["Cookie"])
-
-    def test_cookie_is_not_attached_to_custom_or_non_https_sources(self):
-        untrusted = [
-            "http://cn.wsj.com/zh-hans/news/china",
-            "https://www.wsj.com/zh-hans/news/china",
-            "https://cn.wsj.com.evil.test/listing",
-            "https://cn.wsj.com:443/zh-hans/news/china",
-            "https://user" + "@cn.wsj.com/zh-hans/news/china",
-        ]
-        with mock.patch.dict(
-            BRIDGE.os.environ,
-            {"WSJ_CN_DATADOME_COOKIE": "must-not-leak"},
-        ):
-            for source in untrusted:
-                with self.subTest(source=source):
-                    self.assertNotIn("Cookie", BRIDGE._request_headers(source))
-
-    def test_cross_origin_redirect_strips_cookie(self):
-        handler = BRIDGE.WsjSessionRedirectHandler()
-        original = BRIDGE.urllib.request.Request(
-            "https://cn.wsj.com/",
-            headers={"Cookie": "datadome=must-not-leak"},
+        request = opener.open.call_args.args[0]
+        self.assertEqual("http://127.0.0.1:8080/v1/list", request.full_url)
+        self.assertEqual("POST", request.get_method())
+        self.assertEqual("Bearer test-token", request.get_header("Authorization"))
+        self.assertIsNone(request.get_header("Cookie"))
+        self.assertEqual(
+            {"url": self.source, "requestId": self.request_id},
+            json.loads(request.data),
         )
+        self.assertEqual(120, opener.open.call_args.kwargs["timeout"])
+        self.assertIn("valid article title", page)
 
-        redirected = handler.redirect_request(
-            original,
-            None,
-            302,
-            "Found",
+    def test_non_loopback_base_url_is_rejected_before_open(self):
+        with (
+            mock.patch.dict(
+                BRIDGE.os.environ,
+                {"BPC_BASE_URL": "https://example.test", "BPC_API_TOKEN": "must-not-leak"},
+                clear=True,
+            ),
+            mock.patch.object(BRIDGE.urllib.request, "build_opener") as build_opener,
+        ):
+            with self.assertRaisesRegex(ValueError, "loopback"):
+                BRIDGE.fetch_url(self.source, timeout=1)
+        build_opener.assert_not_called()
+
+    def test_missing_bpc_token_fails_closed(self):
+        with mock.patch.dict(
+            BRIDGE.os.environ,
+            {"BPC_BASE_URL": "http://127.0.0.1:8080", "BPC_API_TOKEN": ""},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, "BPC_API_TOKEN is required"):
+                BRIDGE.fetch_url(self.source, timeout=1)
+
+    def test_structured_bpc_error_is_safe_and_preserves_retryable(self):
+        body = io.BytesIO(
+            json.dumps(
+                {"ok": False, "code": "SERVICE_NOT_READY", "retryable": True}
+            ).encode("utf-8")
+        )
+        error = urllib.error.HTTPError(
+            "http://127.0.0.1:8080/v1/list",
+            503,
+            "Service Unavailable",
             {},
-            "https://example.test/listing",
+            body,
         )
-
-        self.assertIsNotNone(redirected)
-        self.assertIsNone(redirected.get_header("Cookie"))
-
-    def test_unset_optional_values_preserve_default_headers(self):
-        with mock.patch.dict(
-            BRIDGE.os.environ,
-            {"WSJ_CN_USER_AGENT": "", "WSJ_CN_DATADOME_COOKIE": ""},
+        opener = mock.Mock()
+        opener.open.side_effect = error
+        with (
+            mock.patch.dict(
+                BRIDGE.os.environ,
+                {
+                    "BPC_BASE_URL": "http://127.0.0.1:8080",
+                    "BPC_API_TOKEN": "test-token",
+                },
+                clear=True,
+            ),
+            mock.patch.object(BRIDGE, "_new_list_request_id", return_value=self.request_id),
+            mock.patch.object(BRIDGE.urllib.request, "build_opener", return_value=opener),
         ):
-            headers = BRIDGE._request_headers("https://cn.wsj.com/")
+            with self.assertRaises(BRIDGE.BpcListError) as raised:
+                BRIDGE.fetch_url(self.source, timeout=1)
 
-        self.assertEqual(BRIDGE.USER_AGENT, headers["User-Agent"])
-        self.assertNotIn("Cookie", headers)
+        self.assertEqual(503, raised.exception.status)
+        self.assertEqual("SERVICE_NOT_READY", raised.exception.code)
+        self.assertTrue(raised.exception.retryable)
+
+    def test_untrusted_final_url_and_mismatched_request_id_are_rejected(self):
+        cases = [
+            self._success(canonicalUrl="https://example.test/listing"),
+            {**self._success(), "requestId": "another-request"},
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                opener = mock.Mock()
+                opener.open.return_value = FakeResponse(payload)
+                with (
+                    mock.patch.dict(
+                        BRIDGE.os.environ,
+                        {
+                            "BPC_BASE_URL": "http://127.0.0.1:8080",
+                            "BPC_API_TOKEN": "test-token",
+                        },
+                        clear=True,
+                    ),
+                    mock.patch.object(
+                        BRIDGE,
+                        "_new_list_request_id",
+                        return_value=self.request_id,
+                    ),
+                    mock.patch.object(
+                        BRIDGE.urllib.request,
+                        "build_opener",
+                        return_value=opener,
+                    ),
+                ):
+                    with self.assertRaises(ValueError):
+                        BRIDGE.fetch_url(self.source, timeout=1)
 
 
 class ConcurrentFetchTests(unittest.TestCase):

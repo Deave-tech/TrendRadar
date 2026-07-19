@@ -1,6 +1,18 @@
 import { createHash } from 'node:crypto';
 
 export const WSJ_HOST = 'cn.wsj.com';
+export const WSJ_LIST_URLS = Object.freeze([
+  'https://cn.wsj.com/',
+  'https://cn.wsj.com/zh-hans/news/world',
+  'https://cn.wsj.com/zh-hans/news/china',
+  'https://cn.wsj.com/zh-hans/news/markets',
+  'https://cn.wsj.com/zh-hans/news/economy',
+  'https://cn.wsj.com/zh-hans/news/business',
+  'https://cn.wsj.com/zh-hans/news/technology',
+  'https://cn.wsj.com/zh-hans/news/life-arts',
+  'https://cn.wsj.com/zh-hans/news/opinion',
+]);
+const WSJ_LIST_URL_SET = new Set(WSJ_LIST_URLS);
 
 // The Chinese article pages observed in production serve正文 photography from
 // this exact CDN host. Do not widen this to publisher domain suffixes: delivery
@@ -247,6 +259,28 @@ export function validateWsjArticleUrl(value) {
   // Fragments never reach the server and only create multiple forms of the
   // same input. Drop them while preserving WSJ query parameters.
   url.hash = '';
+  return { ok: true, url };
+}
+
+/** Validate the exact nine listing URLs consumed by the WSJ RSS bridge. */
+export function validateWsjListUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    return { ok: false, reason: 'URL must be an absolute URL' };
+  }
+
+  if (url.protocol !== 'https:')
+    return { ok: false, reason: 'URL must use HTTPS' };
+  if (url.hostname !== WSJ_HOST)
+    return { ok: false, reason: `URL host must be ${WSJ_HOST}` };
+  if (url.port && url.port !== '443')
+    return { ok: false, reason: 'URL must use the default HTTPS port' };
+  if (url.username || url.password)
+    return { ok: false, reason: 'URL credentials are not allowed' };
+  if (url.search || url.hash || !WSJ_LIST_URL_SET.has(url.href))
+    return { ok: false, reason: 'URL is not an allowed WSJ listing page' };
   return { ok: true, url };
 }
 

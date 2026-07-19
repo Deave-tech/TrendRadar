@@ -5,7 +5,18 @@
 // Sites are matched by hostname suffix, so one "wsj.com" entry covers
 // cn.wsj.com, www.wsj.com, ... — extend to any site by pushing a new entry
 // through the API, no code change needed.
-import { readFileSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 export function loadStore(file) {
   try {
@@ -17,7 +28,37 @@ export function loadStore(file) {
 }
 
 export function saveStore(file, store) {
-  writeFileSync(file, JSON.stringify(store, null, 2), { mode: 0o600 });
+  const directory = path.dirname(file);
+  const temp = path.join(directory, `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  let fileDescriptor = null;
+  try {
+    fileDescriptor = openSync(temp, 'wx', 0o600);
+    writeFileSync(fileDescriptor, JSON.stringify(store, null, 2));
+    fsyncSync(fileDescriptor);
+    closeSync(fileDescriptor);
+    fileDescriptor = null;
+    chmodSync(temp, 0o600);
+    renameSync(temp, file);
+
+    // Best effort: the rename is already atomic, but syncing the containing
+    // directory makes the new name durable across a sudden host restart.
+    let directoryDescriptor = null;
+    try {
+      directoryDescriptor = openSync(directory, 'r');
+      fsyncSync(directoryDescriptor);
+    } catch {
+      // Some filesystems do not permit fsync on a directory.
+    } finally {
+      if (directoryDescriptor !== null) closeSync(directoryDescriptor);
+    }
+  } finally {
+    if (fileDescriptor !== null) closeSync(fileDescriptor);
+    try {
+      unlinkSync(temp);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
 }
 
 /** Parse a raw `document.cookie` string into Playwright cookie objects. */
@@ -41,6 +82,30 @@ export function upsertSite(store, site, rawCookie, ua) {
   store[key] = {
     cookies: parseDocumentCookie(rawCookie, key),
     ua: ua || prev.ua || null,
+    updatedAt: new Date().toISOString(),
+  };
+  return store[key];
+}
+
+/** Replace one stored cookie without disturbing the other cookies for a site. */
+export function replaceSiteCookie(store, site, cookie, ua = undefined) {
+  const key = String(site).replace(/^\./, '').toLowerCase();
+  if (!cookie || typeof cookie !== 'object' || typeof cookie.name !== 'string' ||
+    typeof cookie.value !== 'string') throw new TypeError('cookie name and value are required');
+  const prev = store[key] || {};
+  const normalized = {
+    name: cookie.name,
+    value: cookie.value,
+    domain: cookie.domain || `.${key}`,
+    path: cookie.path || '/',
+  };
+  store[key] = {
+    cookies: [
+      ...(Array.isArray(prev.cookies) ? prev.cookies : [])
+        .filter((item) => item && item.name !== normalized.name),
+      normalized,
+    ],
+    ua: ua === undefined ? (prev.ua || null) : (ua || null),
     updatedAt: new Date().toISOString(),
   };
   return store[key];

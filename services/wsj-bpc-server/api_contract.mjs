@@ -15,3 +15,13 @@ export function v1SuccessPayload(requestId, article) {
     article,
   };
 }
+
+export function v1ListSuccessPayload(requestId, list) {
+  return {
+    ok: true,
+    code: 'OK',
+    retryable: false,
+    requestId,
+    list,
+  };
+}

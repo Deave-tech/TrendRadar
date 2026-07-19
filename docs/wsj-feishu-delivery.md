@@ -2,7 +2,7 @@
 
 ## 数据流
 
-1. `wsj-cn-rss-bridge.service` 每 15 分钟并发刷新 WSJ 中文网首页及 8 个栏目，只保留 `https://cn.wsj.com/articles/*`，并原子保存 last-known-good 快照。
+1. `wsj-cn-rss-bridge.service` 每 15 分钟通过本机 BPC `POST /v1/list` 串行刷新 WSJ 中文网首页及 8 个栏目，只保留 `https://cn.wsj.com/articles/*`，并原子保存 last-known-good 快照。
 2. TrendRadar 原有整点任务仍抓取并保存 `wsj-cn` RSS；该 feed 配置 `notify: false`，不会再推送原站链接。
 3. `trendradar-wsj-delivery.timer` 每小时第 10 分钟运行独立 delivery。SQLite outbox 位于 `/var/lib/trendradar/wsj-delivery.db`。
 4. delivery 调用本机 BPC `POST /v1/fetch`；只有正文通过 200/白名单/反爬/付费墙/480 字符/3 段质量门后，才创建飞书 Docx、按页面正文顺序写入文本与可选图片 Block、授予目标群只读权限并发送汇总卡片。
@@ -63,24 +63,28 @@ WSJ_IMAGE_MAX_PIXELS=40000000
 
 BPC 自身敏感值放在 `/etc/trendradar/bpc-server.env`（`root:root`、`0600`）；扩展路径通过 `BPC_DIR` 指向外部 BPC checkout。生产单元强制 `NODE_ENV=production`、`REQUIRE_API_TOKEN=1`、`ENABLE_LEGACY_FETCH=0`；无 Token 会在 Chromium 启动前失败。
 
-Bridge 默认继续使用内置 User-Agent 且不发送 Cookie。若 WSJ 列表页需要与浏览器会话一致，可把可选配置放入 `/etc/trendradar/wsj-bridge.env`（建议 `root:root`、`0600`）：
+Bridge 不再直连 WSJ，也不持有 DataDome Cookie 或浏览器 User-Agent。把本机 BPC 地址和 Bearer Token 放入 `/etc/trendradar/wsj-bridge.env`（`root:root`、`0600`）：
 
 ```ini
-WSJ_CN_USER_AGENT=<浏览器 User-Agent>
-WSJ_CN_DATADOME_COOKIE=<仅填写 datadome 的 token，不要包含 datadome=>
+BPC_BASE_URL=http://127.0.0.1:8080
+BPC_API_TOKEN=<与 /etc/trendradar/bpc-server.env 的 API_TOKEN 相同>
 ```
 
-仓库示例位于 `deploy/systemd/wsj-bridge.env.example`。Bridge 只会向 HTTPS 且主机精确为 `cn.wsj.com` 的请求附加 `datadome=<token>`，跨域或降级重定向会移除 Cookie；自定义 `--source` 不能把会话 Cookie 带到其他站点。未设置这两个变量时行为与默认配置相同。
+仓库示例位于 `deploy/systemd/wsj-bridge.env.example`。Bridge 只允许 loopback `BPC_BASE_URL`，禁用代理和重定向后逐 source 调用严格列表 API；生产单元使用单 worker、单请求 120 秒超时，以覆盖正文任务排队、列表导航及传输余量。列表和正文共用 BPC 的单并发 WSJ 队列与一个持久 Chromium context，DataDome 的读写和轮换因此只发生在该浏览器会话中。缺少 `BPC_API_TOKEN` 或 endpoint 非 loopback 时 Bridge 拒绝启动；刷新期故障仍保留 last-known-good 快照。
 
 ## systemd 安装和启动
 
 仓库模板：
 
-- `/home/ubuntu/TrendRadar/deploy/systemd/bpc-server.service`
-- `/home/ubuntu/TrendRadar/deploy/systemd/wsj-cn-rss-bridge.service`
-- `/home/ubuntu/TrendRadar/deploy/systemd/trendradar-wsj-delivery.service`
-- `/home/ubuntu/TrendRadar/deploy/systemd/trendradar-wsj-delivery.timer`
-- `/home/ubuntu/TrendRadar/deploy/systemd/trendradar-wsj-backfill.service`
+- `deploy/systemd/bpc-server.service`
+- `deploy/systemd/wsj-cn-rss-bridge.service`
+- `deploy/systemd/trendradar-wsj-delivery.service`
+- `deploy/systemd/trendradar-wsj-delivery.timer`
+- `deploy/systemd/trendradar-wsj-backfill.service`
+
+模板按 Tokyo 主机的 `ubuntu` 用户和 `/home/ubuntu/TrendRadar` checkout 编写；
+部署到其他主机时先调整各 unit 的 `User`、`HOME`、`WorkingDirectory` 和
+`ExecStart`。
 
 安装后执行：
 
@@ -150,14 +154,14 @@ sqlite3 -readonly /var/lib/trendradar/wsj-delivery.db \
   "select status,count(*) from articles group by status order by status;"
 
 sqlite3 -readonly /var/lib/trendradar/wsj-delivery.db \
-  "select article_key,status,last_error_code,document_url from articles where status in ('manual','unknown');"
+  "select article_key,status,last_error_code,document_url <> '' as has_document_url from articles where status in ('manual','unknown');"
 ```
 
 `unknown` 必须先在飞书中按标题核对是否已经生成文档，再人工决定如何修复数据库；不要删除行后盲目重跑。
 
 ## Cookie 更新与验收
 
-Cookie 失效时通过 BPC 的鉴权 `/cookies` 接口更新 `wsj.com` 记录。不要把 Cookie、App Secret 或 Token 写入 Git、日志或命令输出。
+Cookie 失效时通过 BPC 的鉴权 `/cookies` 接口更新 `wsj.com` 记录。人工注入只发生一次；此后列表与正文响应产生的 DataDome 轮换会在共享队列释放前原子写回 Cookie store。若写回失败，BPC 会在当前任务释放前关闭 WSJ 队列，`/healthz` 及后续列表、正文请求持续返回 `SESSION_PERSIST_FAILED`；Delivery 将其视为系统性故障并停止本轮批量抓取。修复存储后必须重启 BPC，不会在进程内重新打开队列。不要把 Cookie、App Secret 或 Token 写入 Git、日志或命令输出。
 
 验收至少检查：
 
