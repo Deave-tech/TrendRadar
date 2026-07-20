@@ -5,6 +5,7 @@ Playwright Chromium context with an external Bypass Paywalls Clean extension,
 then exposes only:
 
 - `POST /v1/fetch` for `https://cn.wsj.com/articles/*`
+- `POST /v1/economist/fetch` for dated `https://www.economist.com/*` articles
 - `POST /v1/list` for the exact homepage and eight listing URLs used by the bridge
 - `GET /healthz`
 - authenticated cookie maintenance endpoints
@@ -32,6 +33,12 @@ Deleting a live WSJ session through `/cookies` is rejected because it cannot be
 made atomic with an in-flight browser rotation; stop the service before
 removing the durable WSJ session, or replace it through the serialized update.
 
+Economist article jobs use a separate serialized queue. The endpoint accepts
+only one-section dated prose-article URLs, rejects cross-article redirects and
+challenge/paywall responses, and extracts only article paragraphs plus
+publisher-owned hero/body figures. Image URLs are normalized to a deterministic
+supported format before the delivery service downloads them.
+
 ## Development
 
 ```bash
@@ -48,3 +55,7 @@ The WSJ response contains stable metadata, paragraphs and article-scoped images.
 It accepts ordinary prose-flow media plus WSJ's publisher-owned tail gallery,
 while rejecting ads, sidebars, recirculation cards, linked article thumbnails,
 non-WSJ CDN hosts, icons and duplicate `im-*` renditions.
+
+The Economist response uses the same stable contract. It excludes podcast,
+video, interactive and recommendation content, and retains article figure
+captions and intrinsic dimensions for Feishu rendering.

@@ -1,5 +1,5 @@
 [Unit]
-Description=TrendRadar WSJ BPC article fetch API
+Description=TrendRadar publisher BPC article fetch API
 After=network-online.target
 Wants=network-online.target
 

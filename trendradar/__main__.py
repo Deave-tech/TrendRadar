@@ -1658,9 +1658,11 @@ def main():
 诊断命令:
   --doctor               运行环境与配置体检
   --test-notification    发送测试通知到已配置渠道
-WSJ 云文档投递:
+全文云文档投递:
   --wsj-delivery         运行一次独立的 WSJ 全文投递
+  --economist-delivery   运行一次独立的 Economist 全文投递
   --backfill-current     首次显式初始化并回补当前 feed（可配合 --drain）
+  --initialize-current-only 仅把当前 feed 建为已见基线，不创建文档
 
 示例:
   python -m trendradar                    # 正常运行
@@ -1674,25 +1676,49 @@ WSJ 云文档投递:
     parser.add_argument("--test-notification", action="store_true", help="发送测试通知到已配置渠道")
     parser.add_argument("--wsj-delivery", action="store_true", help="运行一次 WSJ 全文云文档投递")
     parser.add_argument(
-        "--backfill-current", action="store_true", help="首次初始化并处理当前 WSJ feed"
+        "--economist-delivery",
+        action="store_true",
+        help="运行一次 Economist 全文云文档投递",
     )
     parser.add_argument(
-        "--drain", action="store_true", help="持续处理 WSJ outbox，直到无立即可运行项或达到时限"
+        "--backfill-current", action="store_true", help="首次初始化并处理当前来源 feed"
+    )
+    parser.add_argument(
+        "--drain", action="store_true", help="持续处理全文 outbox，直到无立即可运行项或达到时限"
+    )
+    parser.add_argument(
+        "--initialize-current-only",
+        action="store_true",
+        help="仅初始化当前来源基线，不创建云文档",
     )
 
     args = parser.parse_args()
 
-    if (args.backfill_current or args.drain) and not args.wsj_delivery:
-        parser.error("--backfill-current/--drain 只能与 --wsj-delivery 一起使用")
+    if args.wsj_delivery and args.economist_delivery:
+        parser.error("--wsj-delivery 与 --economist-delivery 不能同时使用")
+    if (args.backfill_current or args.drain or args.initialize_current_only) and not (
+        args.wsj_delivery or args.economist_delivery
+    ):
+        parser.error(
+            "--backfill-current/--drain/--initialize-current-only 只能与 "
+            "--wsj-delivery 或 "
+            "--economist-delivery 一起使用"
+        )
+    if args.initialize_current_only and (args.backfill_current or args.drain):
+        parser.error(
+            "--initialize-current-only 不能与 --backfill-current/--drain 同时使用"
+        )
 
     debug_mode = False
     try:
-        if args.wsj_delivery:
+        if args.wsj_delivery or args.economist_delivery:
             from trendradar.wsj_delivery import run_cli
 
             exit_code = run_cli(
                 backfill_current=args.backfill_current,
                 drain=args.drain,
+                publisher="economist" if args.economist_delivery else "wsj",
+                initialize_current_only=args.initialize_current_only,
             )
             if exit_code:
                 raise SystemExit(exit_code)

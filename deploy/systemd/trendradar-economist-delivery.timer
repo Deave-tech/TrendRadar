@@ -1,0 +1,11 @@
+[Unit]
+Description=Deliver new Economist articles to Feishu hourly at minute 40
+
+[Timer]
+OnCalendar=*-*-* *:40:00
+AccuracySec=1min
+Persistent=true
+Unit=trendradar-economist-delivery.service
+
+[Install]
+WantedBy=timers.target

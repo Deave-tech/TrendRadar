@@ -1,5 +1,5 @@
 # coding=utf-8
-"""State-machine runner and CLI glue for WSJ-to-Feishu delivery."""
+"""State-machine runner and CLI glue for publisher-to-Feishu delivery."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from .clients import (
     image_patch_client_token,
     message_uuid,
     partition_summary_cards,
+    _detect_image_info,
 )
 from .models import (
     AlreadyRunning,
@@ -81,16 +82,39 @@ class DeliveryRunner:
             max_redirects=config.image_max_redirects,
             max_pixels=config.image_max_pixels,
             allowed_hosts=config.image_allowed_hosts,
+            referer=config.image_referer,
+            user_agent=f"TrendRadar-{config.display_name}-Image/1.0",
         )
         self.clock = clock
         self._halt_bpc = False
         self._halt_feishu = False
         self._retention_capacity_blocked = False
 
-    def run(self, *, backfill_current: bool = False, drain: bool = False) -> RunSummary:
-        if not self.outbox.is_initialized() and not backfill_current:
+    def run(
+        self,
+        *,
+        backfill_current: bool = False,
+        drain: bool = False,
+        initialize_current_only: bool = False,
+    ) -> RunSummary:
+        if backfill_current and initialize_current_only:
             raise InitializationRequired(
-                "WSJ delivery state 尚未初始化；请显式运行 --backfill-current"
+                "--backfill-current 与 --initialize-current-only 不能同时使用"
+            )
+        if drain and initialize_current_only:
+            raise InitializationRequired(
+                "--initialize-current-only 不执行远程写入，不能与 --drain 同时使用"
+            )
+        if self.outbox.is_initialized() and initialize_current_only:
+            raise InitializationRequired(
+                f"{self.config.display_name} delivery state 已初始化"
+            )
+        if not self.outbox.is_initialized() and not (
+            backfill_current or initialize_current_only
+        ):
+            raise InitializationRequired(
+                f"{self.config.display_name} delivery state 尚未初始化；"
+                "请显式运行 --backfill-current"
             )
 
         now = self.clock()
@@ -107,9 +131,20 @@ class DeliveryRunner:
             # The explicit initial backfill has no safe snapshot to fall back
             # to, so initialization still requires a successful non-empty feed.
             feed_items = self.feed.fetch()
-            discovered = self.outbox.initialize_with_items(feed_items, now)
+            if initialize_current_only:
+                discovered = self.outbox.initialize_current_only(feed_items, now)
+            else:
+                discovered = self.outbox.initialize_with_items(feed_items, now)
 
         summary = RunSummary(discovered=discovered)
+        if initialize_current_only:
+            summary.retention_occupied = self.outbox.occupied_document_count()
+            summary.retention_excess = self.outbox.retention_excess(
+                self.config.max_cloud_documents
+            )
+            summary.retention_capacity_blocked = bool(summary.retention_excess)
+            summary.status_counts = self.outbox.status_counts()
+            return summary
         # Resume an earlier overflow before doing new remote writes.  A second
         # pass after notification handles documents created by this run.
         summary.retention_deleted += self._enforce_document_retention()
@@ -200,7 +235,7 @@ class DeliveryRunner:
             status = row["status"]
             if status == "discovered":
                 request_id = row.get("bpc_request_id") or deterministic_uuid(
-                    f"trendradar-wsj-bpc:{article_key}"
+                    f"trendradar-{self.config.publisher}-bpc:{article_key}"
                 )
                 self.outbox.mark_fetch_pending(article_key, request_id, self.clock())
                 continue
@@ -229,7 +264,10 @@ class DeliveryRunner:
                             self.clock(),
                         )
                     return self.outbox.get(article_key)["status"]
-                self.outbox.mark_fetched(article_key, article, self.clock())
+                if not self.outbox.mark_fetched(
+                    article_key, article, self.clock()
+                ):
+                    return "manual"
                 self._handle_fetch_recovery()
                 continue
 
@@ -245,6 +283,7 @@ class DeliveryRunner:
                         row["canonical_url"] or row["normalized_url"],
                         include_images=self.config.include_images,
                         image_max_count=self.config.image_max_count,
+                        source_name=self.config.source_name,
                     )
                     self.outbox.freeze_render_plan(
                         article_key, plan, self.clock()
@@ -263,7 +302,9 @@ class DeliveryRunner:
                 # create call and persisting its returned document_id.
                 self.outbox.mark_doc_create_started(article_key, self.clock())
                 try:
-                    document_id = self.feishu.create_document(f"WSJ｜{row['title']}")
+                    document_id = self.feishu.create_document(
+                        f"{self.config.display_name}｜{row['title']}"
+                    )
                 except UncertainRemoteResult as error:
                     self.outbox.mark_terminal(
                         article_key,
@@ -296,6 +337,7 @@ class DeliveryRunner:
                         row,
                         row["canonical_url"] or row["normalized_url"],
                         include_images=False,
+                        source_name=self.config.source_name,
                     )
                     self.outbox.freeze_render_plan(
                         article_key, legacy_plan, self.clock()
@@ -421,6 +463,8 @@ class DeliveryRunner:
                 extension=image.extension,
                 sha256=image.sha256,
                 data=image.data,
+                width=image.width,
+                height=image.height,
                 now=self.clock(),
             )
             state = {
@@ -578,6 +622,19 @@ class DeliveryRunner:
         data = bytes(value.get("data") or b"")
         if not data:
             return None
+        width = int(value.get("width") or 0)
+        height = int(value.get("height") or 0)
+        if width <= 0 or height <= 0:
+            _mime, detected_width, detected_height = _detect_image_info(data)
+            if detected_width > 0 and detected_height > 0:
+                width, height = detected_width, detected_height
+                self.outbox.backfill_prepared_image_dimensions(
+                    article_key,
+                    cursor,
+                    width,
+                    height,
+                    self.clock(),
+                )
         return DownloadedImage(
             source_url=str(value.get("source_url") or ""),
             final_url=str(value.get("final_url") or ""),
@@ -585,6 +642,8 @@ class DeliveryRunner:
             mime_type=str(value.get("mime_type") or ""),
             extension=str(value.get("extension") or ""),
             sha256=str(value.get("sha256") or ""),
+            width=width,
+            height=height,
         )
 
     def _handle_feishu_stage_error(self, row: dict, error: DeliveryError) -> str:
@@ -635,7 +694,8 @@ class DeliveryRunner:
             error.code, now, self.config.alert_cooldown_seconds
         ):
             alert_uuid = deterministic_uuid(
-                f"trendradar-wsj-alert:{error.code}:{int(now // self.config.alert_cooldown_seconds)}"
+                f"trendradar-{self.config.publisher}-alert:{error.code}:"
+                f"{int(now // self.config.alert_cooldown_seconds)}"
             )
             # Persist the cooldown before the remote write.  A lost response
             # must not cause the same alert to be resent outside Feishu's
@@ -643,7 +703,7 @@ class DeliveryRunner:
             self.outbox.mark_alert_sent(error.code, now)
             try:
                 self.feishu.send_alert(
-                    "WSJ 全文抓取已暂停",
+                    f"{self.config.display_name} 全文抓取已暂停",
                     f"检测到系统性抓取故障：`{error.code}`。已启动退避与熔断；不会创建低质量云文档。",
                     alert_uuid,
                 )
@@ -657,7 +717,7 @@ class DeliveryRunner:
             kind = str(alert["kind"])
             started = int(float(alert["started_at"]))
             recovery_uuid = deterministic_uuid(
-                f"trendradar-wsj-recovery:{kind}:{started}"
+                f"trendradar-{self.config.publisher}-recovery:{kind}:{started}"
             )
             # Recovery notifications use the same write-ahead rule: mark the
             # incident recovered before sending so a crash cannot duplicate
@@ -665,7 +725,7 @@ class DeliveryRunner:
             self.outbox.mark_alert_recovered(kind, now)
             try:
                 self.feishu.send_alert(
-                    "WSJ 全文抓取已恢复",
+                    f"{self.config.display_name} 全文抓取已恢复",
                     f"系统性抓取故障 `{kind}` 已恢复，文章处理已继续。",
                     recovery_uuid,
                 )
@@ -712,8 +772,12 @@ class DeliveryRunner:
             if value:
                 groups.setdefault(value, []).append(row)
 
-        for part in partition_summary_cards(unassigned, self.config.card_max_bytes):
-            value = message_uuid(part)
+        for part in partition_summary_cards(
+            unassigned,
+            self.config.card_max_bytes,
+            self.config.display_name,
+        ):
+            value = message_uuid(part, self.config.publisher)
             keys = [row["article_key"] for row in part]
             self.outbox.assign_message_uuid(keys, value, self.clock())
             for row in part:
@@ -722,7 +786,7 @@ class DeliveryRunner:
 
         notified = 0
         for value, group in groups.items():
-            card = build_summary_card(group)
+            card = build_summary_card(group, self.config.display_name)
             keys = [row["article_key"] for row in group]
             self.outbox.mark_notification_started(keys, value, self.clock())
             try:
@@ -858,18 +922,31 @@ def _is_managed_feishu_doc_url(value: str, document_id: str) -> bool:
     )
 
 
-def run_cli(*, backfill_current: bool, drain: bool) -> int:
+def run_cli(
+    *,
+    backfill_current: bool,
+    drain: bool,
+    publisher: str = "wsj",
+    initialize_current_only: bool = False,
+) -> int:
     """Build production dependencies from the environment and execute once."""
     outbox: Optional[Outbox] = None
     try:
-        config = DeliveryConfig.from_env()
+        config = DeliveryConfig.from_env(publisher=publisher)
         with ProcessLock(config.db_path):
-            outbox = Outbox(config.db_path)
-            feed = FeedClient(config.feed_url, config.feed_timeout)
+            outbox = Outbox(config.db_path, publisher=config.publisher)
+            feed = FeedClient(
+                config.feed_url,
+                config.feed_timeout,
+                publisher=config.publisher,
+                display_name=config.display_name,
+            )
             bpc = BPCClient(
                 config.bpc_base_url,
                 config.bpc_api_token,
                 config.http_timeout,
+                publisher=config.publisher,
+                endpoint=config.bpc_endpoint,
             )
             feishu = FeishuClient(
                 config.feishu_app_id,
@@ -881,25 +958,36 @@ def run_cli(*, backfill_current: bool, drain: bool) -> int:
             )
             summary = DeliveryRunner(
                 config, outbox, feed, bpc, feishu
-            ).run(backfill_current=backfill_current, drain=drain)
+            ).run(
+                backfill_current=backfill_current,
+                drain=drain,
+                initialize_current_only=initialize_current_only,
+            )
             print(
-                "[WSJ delivery] "
+                f"[{config.display_name} delivery] "
                 + json.dumps(summary.__dict__, ensure_ascii=False, sort_keys=True)
             )
             # Make a stuck cap visible to systemd/monitoring while preserving
             # all durable retry state for the next hourly run.
             return 1 if summary.retention_excess else 0
     except (ConfigurationError, InitializationRequired) as exc:
-        print(f"[WSJ delivery] 配置/初始化错误: {exc}", file=sys.stderr)
+        label = "WSJ" if publisher == "wsj" else "Economist"
+        print(f"[{label} delivery] 配置/初始化错误: {exc}", file=sys.stderr)
         return 2
     except AlreadyRunning as exc:
-        print(f"[WSJ delivery] {exc}", file=sys.stderr)
+        label = "WSJ" if publisher == "wsj" else "Economist"
+        print(f"[{label} delivery] {exc}", file=sys.stderr)
         return 75
     except DeliveryError as exc:
-        print(f"[WSJ delivery] 远程服务错误: {exc.code}", file=sys.stderr)
+        label = "WSJ" if publisher == "wsj" else "Economist"
+        print(f"[{label} delivery] 远程服务错误: {exc.code}", file=sys.stderr)
         return 1
     except Exception as exc:  # keep service logs useful without printing secrets
-        print(f"[WSJ delivery] 运行失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+        label = "WSJ" if publisher == "wsj" else "Economist"
+        print(
+            f"[{label} delivery] 运行失败: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return 1
     finally:
         if outbox is not None:
