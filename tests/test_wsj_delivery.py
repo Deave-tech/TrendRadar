@@ -469,6 +469,7 @@ class BPCClientTests(unittest.TestCase):
             (422, {"ok": False, "code": "DATADOME_CHALLENGE", "retryable": True}, True),
             (429, {"ok": False, "code": "QUEUE_FULL", "retryable": True}, False),
             (503, {"ok": False, "code": "BROWSER_CRASH", "retryable": True}, False),
+            (503, {"ok": False, "code": "SESSION_PERSIST_FAILED", "retryable": True}, True),
         ]
         for status_code, payload, systemic in cases:
             with self.subTest(payload=payload):
@@ -1730,6 +1731,27 @@ class DeliveryRunnerTests(unittest.TestCase):
             self.assertEqual(1, bpc.calls)
             self.assertFalse(summary.drain_deadline_reached)
             self.assertEqual(1000.0, clock.value)
+            outbox.close()
+
+    def test_session_persistence_failure_stops_batch_before_more_fetches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delivery.db"
+            items = [feed_article(f"1234567890{index:02x}") for index in range(3)]
+            error = DeliveryError(
+                "SESSION_PERSIST_FAILED",
+                "BPC session persistence failed",
+                retryable=True,
+                systemic=True,
+            )
+            bpc = FakeBPC(error=error)
+            feishu = FakeFeishu()
+            outbox = Outbox(path)
+            DeliveryRunner(
+                config_for(path), outbox, FakeFeed(items), bpc, feishu
+            ).run(backfill_current=True, drain=True)
+            self.assertEqual(1, bpc.calls)
+            self.assertEqual(0, feishu.create_calls)
+            self.assertEqual(1, len(feishu.alert_calls))
             outbox.close()
 
     def test_drain_backfill_over_20_items_sends_one_summary_card(self):

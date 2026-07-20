@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { v1ErrorPayload, v1SuccessPayload } from '../api_contract.mjs';
+import { v1ErrorPayload, v1ListSuccessPayload, v1SuccessPayload } from '../api_contract.mjs';
 import { BoundedQueue, QueueClosedError, QueueFullError } from '../queue.mjs';
 import {
   articleSha256,
@@ -11,6 +11,8 @@ import {
   sanitizeWsjImages,
   validRequestId,
   validateWsjArticleUrl,
+  validateWsjListUrl,
+  WSJ_LIST_URLS,
 } from '../wsj.mjs';
 
 test('WSJ URL allowlist accepts only HTTPS Chinese article URLs', () => {
@@ -28,6 +30,30 @@ test('WSJ URL allowlist accepts only HTTPS Chinese article URLs', () => {
     'not a URL',
   ]) {
     assert.equal(validateWsjArticleUrl(value).ok, false, value);
+  }
+});
+
+test('WSJ listing allowlist accepts exactly the homepage and eight bridge sections', () => {
+  assert.equal(WSJ_LIST_URLS.length, 9);
+  assert.equal(new Set(WSJ_LIST_URLS).size, 9);
+  for (const value of WSJ_LIST_URLS) {
+    const checked = validateWsjListUrl(value);
+    assert.equal(checked.ok, true, value);
+    assert.equal(checked.url.href, value);
+  }
+
+  for (const value of [
+    'http://cn.wsj.com/',
+    'https://www.wsj.com/',
+    'https://cn.wsj.com/articles/example',
+    'https://cn.wsj.com/zh-hans/news/world/',
+    'https://cn.wsj.com/zh-hans/news/world?mod=nav',
+    'https://cn.wsj.com/zh-hans/news/world#top',
+    'https://cn.wsj.com/zh-hans/news/video',
+    'https://user:pass' + '@cn.wsj.com/',
+    'not a URL',
+  ]) {
+    assert.equal(validateWsjListUrl(value).ok, false, value);
   }
 });
 
@@ -316,6 +342,20 @@ test('v1 payload factories keep the stable ok/code/retryable contract', () => {
     code: 'UNAUTHORIZED',
     retryable: false,
     message: 'no',
+  });
+  const list = {
+    url: 'https://cn.wsj.com/',
+    canonicalUrl: 'https://cn.wsj.com/',
+    status: 200,
+    html: '<html></html>',
+    fetchedAt: '2026-01-01T00:00:00.000Z',
+  };
+  assert.deepEqual(v1ListSuccessPayload('list:1', list), {
+    ok: true,
+    code: 'OK',
+    retryable: false,
+    requestId: 'list:1',
+    list,
   });
 });
 

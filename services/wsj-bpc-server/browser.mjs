@@ -6,6 +6,7 @@ import {
   isAntiBotChallengeUrl,
   sanitizeWsjImages,
   validateWsjArticleUrl,
+  validateWsjListUrl,
 } from './wsj.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,13 +24,17 @@ export const EXTENSION_ID = 'lkbebcjgcmobigpeffafkodonchffocl';
  * removed the side-load flags, and only the new headless mode runs extensions.
  *
  * @param {string} profileDir user-data-dir (keeps extension storage across runs)
- * @param {{ loadExtension?: boolean }} opts
+ * @param {{ loadExtension?: boolean, seedCookies?: object[], userAgent?: string|null }} opts
  */
-export async function launchBpc(profileDir, { loadExtension = true } = {}) {
+export async function launchBpc(
+  profileDir,
+  { loadExtension = true, seedCookies = undefined, userAgent = undefined } = {}
+) {
   const args = ['--disable-dev-shm-usage'];
   if (loadExtension) {
     args.push(`--disable-extensions-except=${BPC_DIR}`, `--load-extension=${BPC_DIR}`);
   }
+  const effectiveUserAgent = userAgent === undefined ? process.env.BPC_UA : userAgent;
   const context = await chromium.launchPersistentContext(profileDir, {
     channel: 'chromium',
     // BPC_HEADFUL=1 runs a headed browser (use under xvfb-run on servers):
@@ -37,15 +42,19 @@ export async function launchBpc(profileDir, { loadExtension = true } = {}) {
     headless: process.env.BPC_HEADFUL !== '1',
     ...(process.env.PROXY_SERVER ? { proxy: { server: process.env.PROXY_SERVER } } : {}),
     // BPC_UA overrides the UA (match the browser a harvested cookie belongs to).
-    ...(process.env.BPC_UA ? { userAgent: process.env.BPC_UA } : {}),
+    ...(effectiveUserAgent ? { userAgent: effectiveUserAgent } : {}),
     args,
   });
-  // DD_COOKIE carries a DataDome trust cookie harvested from a real browser.
-  if (process.env.DD_COOKIE) {
-    await context.addCookies([
+  // The server passes the current on-disk session here. This is the only WSJ
+  // cookie injection in its lifecycle; individual list/article requests must
+  // keep using Chromium's rotated value instead of resetting an older seed.
+  const effectiveSeedCookies = seedCookies === undefined
+    ? (process.env.DD_COOKIE ? [
       { name: 'datadome', value: process.env.DD_COOKIE, domain: '.wsj.com', path: '/' },
-    ]);
-  }
+    ] : [])
+    : seedCookies;
+  if (Array.isArray(effectiveSeedCookies) && effectiveSeedCookies.length)
+    await context.addCookies(effectiveSeedCookies);
   if (!loadExtension) return { context, sw: null };
   let sw = context.serviceWorkers()[0];
   if (!sw) sw = await context.waitForEvent('serviceworker', { timeout: 30000 });
@@ -522,7 +531,7 @@ export async function readWsjSnapshot(page) {
 export async function fetchWsjArticle(
   context,
   url,
-  { pageTimeoutMs = 45000, settleMs = 6000, cookies = null } = {}
+  { pageTimeoutMs = 45000, settleMs = 6000 } = {}
 ) {
   const input = validateWsjArticleUrl(url);
   if (!input.ok)
@@ -534,8 +543,6 @@ export async function fetchWsjArticle(
   const deadline = Date.now() + pageTimeoutMs;
   let blockedNavigation = null;
   try {
-    if (cookies && cookies.length) await context.addCookies(cookies);
-
     // Abort a main-frame redirect before it reaches a different host/path.
     // Subresources and iframes remain untouched so BPC's DNR rules still see
     // the normal WSJ page load.
@@ -660,6 +667,100 @@ export async function fetchWsjArticle(
       paragraphCount: paragraphs.length,
       imageCount: images.length,
       sha256: articleSha256(paragraphs),
+      fetchedAt: new Date().toISOString(),
+    };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+/**
+ * Fetch one of the nine exact WSJ Chinese listing pages for the local bridge.
+ * The caller owns serialization and rotated-cookie persistence.
+ */
+export async function fetchWsjList(
+  context,
+  url,
+  { pageTimeoutMs = 45000, settleMs = 6000 } = {}
+) {
+  const input = validateWsjListUrl(url);
+  if (!input.ok)
+    throw new WsjFetchError('URL_NOT_ALLOWED', 403, false, input.reason);
+  if (!browserConnected(context))
+    throw new WsjFetchError('SERVICE_NOT_READY', 503, true, 'browser is not connected');
+
+  const page = await context.newPage();
+  const deadline = Date.now() + pageTimeoutMs;
+  let blockedNavigation = null;
+  try {
+    // Fail closed for every main-frame redirect. This is intentionally stricter
+    // than merely checking the final URL: no cookie-bearing navigation may
+    // leave the exact listing allowlist, even temporarily.
+    await page.route('**/*', async (route) => {
+      const request = route.request();
+      if (request.resourceType() === 'document' && request.frame() === page.mainFrame()) {
+        const checked = validateWsjListUrl(request.url());
+        if (!checked.ok) {
+          blockedNavigation = isAntiBotChallengeUrl(request.url()) ? 'challenge' : 'scope';
+          return route.abort('blockedbyclient');
+        }
+      }
+      return route.fallback();
+    });
+
+    let response;
+    try {
+      response = await page.goto(input.url.href, {
+        waitUntil: 'domcontentloaded',
+        timeout: Math.max(1, deadline - Date.now()),
+      });
+    } catch (error) {
+      if (blockedNavigation === 'challenge')
+        throw new WsjFetchError('CHALLENGE_DETECTED', 422, true, 'anti-bot challenge redirect was blocked');
+      if (blockedNavigation === 'scope')
+        throw new WsjFetchError('URL_NOT_ALLOWED', 403, false, 'redirect outside the listing allowlist was blocked');
+      throw new WsjFetchError('UPSTREAM_ERROR', 502, true, 'upstream navigation failed', {
+        reason: error?.name === 'TimeoutError' ? 'timeout' : 'navigation',
+      });
+    }
+
+    const finalUrl = validateWsjListUrl(page.url());
+    if (!finalUrl.ok && isAntiBotChallengeUrl(page.url()))
+      throw new WsjFetchError('CHALLENGE_DETECTED', 422, true, 'anti-bot challenge redirect detected');
+    if (!finalUrl.ok)
+      throw new WsjFetchError('URL_NOT_ALLOWED', 403, false, 'upstream redirected outside the listing allowlist');
+    if (!response)
+      throw new WsjFetchError('UPSTREAM_ERROR', 502, true, 'upstream returned no document response');
+    if (response.status() !== 200)
+      throw new WsjFetchError('UPSTREAM_STATUS', 502, true, 'upstream did not return HTTP 200', {
+        upstreamStatus: response.status(),
+      });
+
+    const initialWait = Math.min(settleMs, Math.max(0, deadline - Date.now()));
+    if (initialWait) await page.waitForTimeout(initialWait);
+
+    const challenge = await page.evaluate(() => {
+      const bodyStart = String(document.body?.innerText || '').slice(0, 4000);
+      const challengeElement = document.querySelector(
+        '#datadome-captcha, iframe[src*="captcha-delivery"], script[src*="captcha-delivery"], [class*="captcha" i]'
+      );
+      const challengeWords = /verify (that )?you are human|unusual activity|press and hold|captcha|请.{0,8}(验证|完成验证)|访问.{0,8}(受限|异常)/i;
+      return Boolean(challengeElement) ||
+        /captcha-delivery\.com|geo\.captcha-delivery\.com/i.test(location.href) ||
+        challengeWords.test(document.title) || challengeWords.test(bodyStart);
+    });
+    if (challenge)
+      throw new WsjFetchError('CHALLENGE_DETECTED', 422, true, 'anti-bot challenge detected');
+
+    const html = await page.content();
+    if (!html || Buffer.byteLength(html, 'utf8') > 10 * 1024 * 1024)
+      throw new WsjFetchError('LIST_NOT_READY', 503, true, 'listing HTML was empty or exceeded the size limit');
+
+    return {
+      url: finalUrl.url.href,
+      canonicalUrl: finalUrl.url.href,
+      status: response.status(),
+      html,
       fetchedAt: new Date().toISOString(),
     };
   } finally {

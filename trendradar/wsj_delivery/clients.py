@@ -1191,6 +1191,11 @@ def _response_json(response) -> dict:
 def _is_systemic_bpc_error(status: int, code: str) -> bool:
     if status == 401:
         return True
+    # The BPC service has already stopped its serialized WSJ queue because the
+    # browser's rotated DataDome value could not be durably saved. Continuing
+    # this batch would only produce the same fail-closed 503 until restart.
+    if code == "SESSION_PERSIST_FAILED":
+        return True
     # HTTP 403 is also used for URL_NOT_ALLOWED/FORBIDDEN_URL, which is an
     # article-specific policy error and must not stop the whole queue.
     markers = (
