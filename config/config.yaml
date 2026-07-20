@@ -149,6 +149,14 @@ rss:
       max_age_days: 0
       notify: false
 
+    # Economist articles are archived normally; the dedicated delivery worker
+    # sends full-text Feishu Docx links (with article-scoped images) instead.
+    - id: "economist"
+      name: "The Economist"
+      url: "http://127.0.0.1:4556/economist.xml"
+      max_age_days: 0
+      notify: false
+
     # 自定义源示例
     # - id: "custom-feed"
     #   name: "自定义源"

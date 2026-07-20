@@ -133,8 +133,9 @@ discovered -> fetch_pending -> fetched -> doc_created -> shared -> notified
   结果不确定进入 `unknown`，不会盲目重复上传；图片绑定使用确定性 client token。
 - BPC Cookie、DataDome、CAPTCHA 或付费墙等系统性故障会熔断批量抓取。同类告警最多每 6 小时一次，恢复后通知一次。
 - 卡片使用确定性 UUID；同一轮文章尽量合并一张，序列化超过 30KB 才拆分。
-- 每轮投递和通知完成后统计本 WSJ outbox 中尚未确认删除的 Docx；默认最多
-  `300` 个（`WSJ_MAX_CLOUD_DOCUMENTS` 可配置）。超限时只按文档创建时间从老到新
+- 每轮投递和通知完成后统计共享 outbox 中 WSJ 与 Economist 尚未确认删除的
+  Docx；默认两站合计最多 `300` 个（`NEWS_MAX_CLOUD_DOCUMENTS` 可配置）。超限时
+  只按文档创建时间从老到新
   删除 `status=notified` 的文档；`doc_created`、`shared`、`manual`、`unknown` 等文档
   仍计入总量但绝不作为自动删除候选。创建结果不确定且尚无文档 ID 时也保守预留
   一个名额。程序不会扫描或删除 outbox 之外的云文档。

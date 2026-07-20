@@ -1,0 +1,19 @@
+[Unit]
+Description=Initialize current Economist feed as a no-delivery baseline
+After=network-online.target economist-rss-bridge.service
+Wants=network-online.target
+Requires=economist-rss-bridge.service
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/TrendRadar
+Environment=HOME=/home/ubuntu
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/trendradar/wsj-delivery.env
+StateDirectory=trendradar
+UMask=0077
+ExecStart=/home/ubuntu/.local/bin/uv run python -m trendradar --economist-delivery --initialize-current-only
+SuccessExitStatus=75
+TimeoutStartSec=5min

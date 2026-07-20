@@ -164,7 +164,11 @@ class FakeBPC:
         self.calls += 1
         if self.error:
             raise self.error
-        return self.result or fetched_article(request_id=request_id, title=fallback_title)
+        return self.result or fetched_article(
+            request_id=request_id,
+            title=fallback_title,
+            canonical_url=url,
+        )
 
 
 class FakeImageDownloader:
@@ -308,13 +312,18 @@ def feed_article(suffix="abcdef123456", query=""):
     )
 
 
-def fetched_article(request_id="request", title="测试标题", paragraph_count=3):
+def fetched_article(
+    request_id="request",
+    title="测试标题",
+    paragraph_count=3,
+    canonical_url="https://cn.wsj.com/articles/test-story-abcdef123456",
+):
     paragraphs = tuple(f"第 {index} 段 " + "正文" * 120 for index in range(paragraph_count))
     text = "\n\n".join(paragraphs)
     import hashlib
 
     return FetchedArticle(
-        canonical_url="https://cn.wsj.com/articles/test-story-abcdef123456",
+        canonical_url=canonical_url,
         title=title or "测试标题",
         author="记者",
         published_at="2026-07-19T10:00:00+08:00",
@@ -468,7 +477,7 @@ class BPCClientTests(unittest.TestCase):
             (403, {"ok": False, "code": "URL_NOT_ALLOWED", "retryable": False}, False),
             (422, {"ok": False, "code": "DATADOME_CHALLENGE", "retryable": True}, True),
             (429, {"ok": False, "code": "QUEUE_FULL", "retryable": True}, False),
-            (503, {"ok": False, "code": "BROWSER_CRASH", "retryable": True}, False),
+            (503, {"ok": False, "code": "BROWSER_CRASH", "retryable": True}, True),
             (503, {"ok": False, "code": "SESSION_PERSIST_FAILED", "retryable": True}, True),
         ]
         for status_code, payload, systemic in cases:
@@ -2113,6 +2122,167 @@ class DeliveryRunnerTests(unittest.TestCase):
             self.assertEqual("WSJ 全文抓取已恢复", feishu.alert_calls[-1][0])
             self.assertEqual("notified", outbox.get(item.article_key)["status"])
             outbox.close()
+
+
+class OutboxPublisherScopeTests(unittest.TestCase):
+    @staticmethod
+    def economist_article(suffix="economist-1"):
+        url = f"https://www.economist.com/business/2026/07/20/{suffix}"
+        return FeedArticle(
+            article_key=f"economist:{suffix}",
+            article_id=suffix,
+            normalized_url=url,
+            source_url=url,
+            title=f"Economist {suffix}",
+            published_at="2026-07-20T00:00:00Z",
+            author="The Economist",
+            publisher="economist",
+        )
+
+    def test_publishers_initialize_and_process_notifications_independently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delivery.db"
+            wsj_item = feed_article("publisher0001")
+            economist_item = self.economist_article()
+
+            with Outbox(path, publisher="wsj") as wsj:
+                self.assertFalse(wsj.is_initialized())
+                wsj.initialize_with_items([wsj_item], 1000)
+                self.assertTrue(wsj.is_initialized())
+
+            with Outbox(path, publisher="economist") as economist:
+                self.assertFalse(economist.is_initialized())
+                economist.initialize_with_items([economist_item], 1001)
+                self.assertTrue(economist.is_initialized())
+
+            with Outbox(path, publisher="wsj") as wsj, Outbox(
+                path, publisher="economist"
+            ) as economist:
+                self.assertEqual(
+                    [wsj_item.article_key],
+                    [row["article_key"] for row in wsj.get_work(2000, 20)],
+                )
+                self.assertEqual(
+                    [economist_item.article_key],
+                    [row["article_key"] for row in economist.get_work(2000, 20)],
+                )
+                with wsj._conn:
+                    wsj._conn.execute(
+                        "UPDATE articles SET status='shared', message_uuid='same'"
+                    )
+
+                self.assertEqual(
+                    [wsj_item.article_key],
+                    [row["article_key"] for row in wsj.pending_shared(2000)],
+                )
+                self.assertEqual(
+                    [economist_item.article_key],
+                    [row["article_key"] for row in economist.pending_shared(2000)],
+                )
+                wsj.mark_notified(
+                    [wsj_item.article_key, economist_item.article_key], "same", 2001
+                )
+                self.assertEqual({"notified": 1}, wsj.status_counts())
+                self.assertEqual({"shared": 1}, economist.status_counts())
+                self.assertEqual(
+                    [economist_item.article_key],
+                    [row["article_key"] for row in economist.pending_shared(2002)],
+                )
+
+    def test_circuits_and_alerts_are_publisher_scoped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delivery.db"
+            with Outbox(path, publisher="wsj") as wsj, Outbox(
+                path, publisher="economist"
+            ) as economist:
+                wsj.activate_circuit("DATADOME_CHALLENGE", 1000, 60)
+                self.assertTrue(wsj.circuit_blocked(1001))
+                self.assertFalse(economist.circuit_blocked(1001))
+
+                self.assertTrue(wsj.activate_alert("FETCH_CHALLENGE", 1000, 21600))
+                self.assertEqual("FETCH_CHALLENGE", wsj.active_alerts()[0]["kind"])
+                self.assertEqual([], economist.active_alerts())
+                self.assertTrue(
+                    economist.activate_alert("FETCH_CHALLENGE", 1001, 21600)
+                )
+                self.assertEqual(1, len(wsj.active_alerts()))
+                self.assertEqual(1, len(economist.active_alerts()))
+
+    def test_retention_count_and_oldest_candidate_are_global(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delivery.db"
+            wsj_item = feed_article("publisher0002")
+            economist_item = self.economist_article("economist-2")
+            with Outbox(path, publisher="wsj") as wsj:
+                wsj.initialize_with_items([wsj_item], 1000)
+            with Outbox(path, publisher="economist") as economist:
+                economist.initialize_with_items([economist_item], 1001)
+                with economist._conn:
+                    economist._conn.execute(
+                        """
+                        UPDATE articles SET status='notified', document_id=?,
+                            document_url=?, document_create_started_at=?, notified_at=?
+                        WHERE article_key=?
+                        """,
+                        (
+                            "docTokenWsj000000000000001",
+                            "https://tenant.feishu.cn/docx/docTokenWsj000000000000001",
+                            1000,
+                            1000,
+                            wsj_item.article_key,
+                        ),
+                    )
+                    economist._conn.execute(
+                        """
+                        UPDATE articles SET status='notified', document_id=?,
+                            document_url=?, document_create_started_at=?, notified_at=?
+                        WHERE article_key=?
+                        """,
+                        (
+                            "docTokenEconomist000000001",
+                            "https://tenant.feishu.cn/docx/docTokenEconomist000000001",
+                            1001,
+                            1001,
+                            economist_item.article_key,
+                        ),
+                    )
+
+                self.assertEqual(2, economist.occupied_document_count())
+                candidates = economist.retention_candidates(1)
+                self.assertEqual([wsj_item.article_key], [row["article_key"] for row in candidates])
+
+    def test_prepared_image_dimensions_survive_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "delivery.db"
+            item = feed_article("publisher0003")
+            with Outbox(path) as outbox:
+                outbox.initialize_with_items([item], 1000)
+                with outbox._conn:
+                    outbox._conn.execute(
+                        "UPDATE articles SET status='doc_created', block_cursor=4 "
+                        "WHERE article_key=?",
+                        (item.article_key,),
+                    )
+                outbox.prepare_image(
+                    item.article_key,
+                    4,
+                    source_url="https://images.wsj.net/example.png",
+                    final_url="https://images.wsj.net/example.png",
+                    mime_type="image/png",
+                    extension="png",
+                    sha256="a" * 64,
+                    data=png_bytes(1424, 801),
+                    now=1001,
+                    width=1424,
+                    height=801,
+                )
+
+            with Outbox(path) as reopened:
+                prepared = reopened.get_prepared_image(item.article_key, 4)
+                self.assertIsNotNone(prepared)
+                self.assertEqual((1424, 801), (prepared["width"], prepared["height"]))
+                state = json.loads(reopened.get(item.article_key)["image_states_json"])["4"]
+                self.assertEqual((1424, 801), (state["width"], state["height"]))
 
 
 if __name__ == "__main__":

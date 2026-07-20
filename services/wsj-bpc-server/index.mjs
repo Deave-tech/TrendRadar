@@ -1,6 +1,7 @@
 // HTTP API around a warm Chromium context with BPC loaded.
 //   POST /v1/fetch       -> strict cn.wsj.com article extraction
 //   POST /v1/list        -> strict WSJ Chinese listing HTML
+//   POST /v1/economist/fetch -> strict Economist article extraction
 //   GET  /fetch?url=...  -> legacy general-page extraction (configurable)
 //   GET  /healthz        -> browser, BPC and queue health
 //   GET/PUT/DELETE /cookies -> per-site cookie store
@@ -11,6 +12,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   browserConnected,
+  fetchEconomistArticle,
   fetchArticle,
   fetchWsjArticle,
   fetchWsjList,
@@ -22,6 +24,11 @@ import { v1ErrorPayload, v1ListSuccessPayload, v1SuccessPayload } from './api_co
 import { loadStore, saveStore, upsertSite, deleteSite, findSite, maskedView } from './cookies.mjs';
 import { BoundedQueue, QueueClosedError, QueueFullError } from './queue.mjs';
 import { validRequestId, validateWsjArticleUrl, validateWsjListUrl, WSJ_HOST } from './wsj.mjs';
+import {
+  ECONOMIST_HOST,
+  EconomistFetchError,
+  validateEconomistArticleUrl,
+} from './economist.mjs';
 import { applyWsjSessionUpdate, runWsjSessionTask, wsjStartupSession } from './wsj_session.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -44,11 +51,10 @@ const COOKIES_FILE = process.env.COOKIES_FILE || path.join(__dirname, '.cookies.
 const MAX_CONCURRENCY = integerEnv('MAX_CONCURRENCY', 2, 1, 32);
 const MAX_QUEUE = integerEnv('MAX_QUEUE', 20, 0, 1000);
 const WSJ_MAX_QUEUE = integerEnv('WSJ_MAX_QUEUE', 20, 0, 1000);
+const ECONOMIST_MAX_QUEUE = integerEnv('ECONOMIST_MAX_QUEUE', 20, 0, 1000);
 const PAGE_TIMEOUT_MS = integerEnv('PAGE_TIMEOUT_MS', 45000, 1000, 300000);
 const SETTLE_MS = integerEnv('SETTLE_MS', 6000, 0, PAGE_TIMEOUT_MS - 1);
-// The general-purpose endpoint is an explicit development-only opt-in. A
-// missing environment variable must not silently expose an SSRF-capable route.
-const ENABLE_LEGACY_FETCH = process.env.ENABLE_LEGACY_FETCH === '1';
+const ENABLE_LEGACY_FETCH = process.env.ENABLE_LEGACY_FETCH !== '0';
 const PRODUCTION = process.env.NODE_ENV === 'production' || process.env.BPC_PRODUCTION === '1';
 const EXTERNAL_BIND = !['127.0.0.1', '::1', 'localhost'].includes(HOST);
 const REQUIRE_API_TOKEN = process.env.REQUIRE_API_TOKEN === '1' || PRODUCTION || EXTERNAL_BIND;
@@ -84,6 +90,7 @@ console.log(`cookie sites: ${Object.keys(store).join(', ') || '(none)'}`);
 // The WSJ delivery path is intentionally serialized. Legacy fetches use a
 // separate bounded queue and should be disabled on the production unit.
 const wsjQueue = new BoundedQueue(1, WSJ_MAX_QUEUE);
+const economistQueue = new BoundedQueue(1, ECONOMIST_MAX_QUEUE);
 const legacyQueue = new BoundedQueue(MAX_CONCURRENCY, MAX_QUEUE);
 let shuttingDown = false;
 let wsjSessionHealthy = true;
@@ -232,7 +239,11 @@ async function handleCookies(req, res, url) {
 }
 
 function serviceReady() {
-  return !shuttingDown && wsjSessionHealthy && browserConnected(context) &&
+  return wsjSessionHealthy && browserServiceReady();
+}
+
+function browserServiceReady() {
+  return !shuttingDown && browserConnected(context) &&
     bpcReady.sitesInStorage > 0 && bpcReady.dnrSessionRules > 0;
 }
 
@@ -304,6 +315,65 @@ async function handleV1Fetch(req, res) {
   }
 }
 
+function sendEconomistTaskError(res, error, requestId) {
+  if (error instanceof QueueFullError)
+    return sendV1Error(res, 429, 'QUEUE_FULL', true, 'Economist fetch queue is full', requestId, undefined);
+  if (error instanceof QueueClosedError)
+    return sendV1Error(res, 503, 'SERVICE_NOT_READY', true, 'service is shutting down', requestId, undefined);
+  if (error instanceof EconomistFetchError)
+    return sendV1Error(
+      res,
+      error.httpStatus,
+      error.code,
+      error.retryable,
+      error.message,
+      requestId,
+      error.details
+    );
+  console.error(`v1 Economist fetch failed (requestId=${requestId}): ${error?.name || 'Error'}`);
+  return sendV1Error(res, 502, 'UPSTREAM_ERROR', true, 'unexpected browser failure', requestId, undefined);
+}
+
+async function handleEconomistFetch(req, res) {
+  if (req.method !== 'POST')
+    return sendV1Error(res, 405, 'METHOD_NOT_ALLOWED', false, 'POST is required', undefined, undefined);
+
+  let body;
+  try {
+    body = JSON.parse(await readBody(req, 16 * 1024));
+  } catch (error) {
+    const message = error?.message === 'body too large' ? 'request body is too large' : 'request body must be valid JSON';
+    return sendV1Error(res, 400, 'INVALID_REQUEST', false, message, undefined, undefined);
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.url !== 'string')
+    return sendV1Error(res, 400, 'INVALID_REQUEST', false, 'body must contain string fields url and requestId', undefined, undefined);
+  if (!validRequestId(body.requestId))
+    return sendV1Error(res, 400, 'INVALID_REQUEST', false, 'requestId must be 1-128 safe ASCII characters', undefined, undefined);
+  const requestId = body.requestId;
+
+  try {
+    new URL(body.url);
+  } catch {
+    return sendV1Error(res, 400, 'INVALID_REQUEST', false, 'url must be an absolute URL', requestId, undefined);
+  }
+  const checked = validateEconomistArticleUrl(body.url);
+  if (!checked.ok)
+    return sendV1Error(res, 403, 'URL_NOT_ALLOWED', false, checked.reason, requestId, undefined);
+  if (!browserServiceReady())
+    return sendV1Error(res, 503, 'SERVICE_NOT_READY', true, 'browser or BPC rules are not ready', requestId, undefined);
+
+  try {
+    const article = await economistQueue.run(() => fetchEconomistArticle(
+      context,
+      checked.url.href,
+      { pageTimeoutMs: PAGE_TIMEOUT_MS, settleMs: SETTLE_MS }
+    ));
+    return sendJson(res, 200, v1SuccessPayload(requestId, article));
+  } catch (error) {
+    return sendEconomistTaskError(res, error, requestId);
+  }
+}
+
 async function handleV1List(req, res) {
   if (req.method !== 'POST')
     return sendV1Error(res, 405, 'METHOD_NOT_ALLOWED', false, 'POST is required', undefined, undefined);
@@ -352,6 +422,7 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     if (url.pathname === '/healthz') {
       const wsj = wsjQueue.snapshot();
+      const economist = economistQueue.snapshot();
       const legacy = legacyQueue.snapshot();
       const ok = serviceReady();
       return sendJson(res, ok ? 200 : 503, {
@@ -361,15 +432,17 @@ const server = http.createServer(async (req, res) => {
         bpc: bpcReady,
         session: { healthy: wsjSessionHealthy },
         queue: wsj,
+        economist: { queue: economist },
         legacy: { enabled: ENABLE_LEGACY_FETCH, queue: legacy },
         // Retain the original top-level counters for old probes.
-        active: wsj.active + legacy.active,
-        queued: wsj.queued + legacy.queued,
+        active: wsj.active + economist.active + legacy.active,
+        queued: wsj.queued + economist.queued + legacy.queued,
       });
     }
 
     if (!authorized(req)) {
-      if (url.pathname === '/v1/fetch' || url.pathname === '/v1/list')
+      if (url.pathname === '/v1/fetch' || url.pathname === '/v1/list' ||
+        url.pathname === '/v1/economist/fetch')
         return sendV1Error(res, 401, 'UNAUTHORIZED', false, 'valid bearer token required', undefined, undefined);
       return sendJson(res, 401, { error: 'unauthorized: pass "Authorization: Bearer <API_TOKEN>"' });
     }
@@ -377,10 +450,12 @@ const server = http.createServer(async (req, res) => {
       return await handleV1Fetch(req, res);
     if (url.pathname === '/v1/list')
       return await handleV1List(req, res);
+    if (url.pathname === '/v1/economist/fetch')
+      return await handleEconomistFetch(req, res);
     if (url.pathname === '/cookies')
       return await handleCookies(req, res, url);
     if (url.pathname !== '/fetch')
-      return sendJson(res, 404, { error: 'routes: POST /v1/fetch, POST /v1/list, /fetch?url=..., /cookies, /healthz' });
+      return sendJson(res, 404, { error: 'routes: POST /v1/fetch, POST /v1/list, POST /v1/economist/fetch, /fetch?url=..., /cookies, /healthz' });
     if (!ENABLE_LEGACY_FETCH)
       return sendJson(res, 404, { error: 'legacy /fetch route is disabled' });
 
@@ -395,6 +470,8 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 400, { error: 'only http/https urls are allowed' });
     if (isWsjDomain(parsed.hostname))
       return sendJson(res, 403, { error: 'WSJ URLs require POST /v1/fetch or POST /v1/list' });
+    if (String(parsed.hostname || '').toLowerCase().replace(/\.$/, '') === ECONOMIST_HOST)
+      return sendJson(res, 403, { error: 'Economist URLs require POST /v1/economist/fetch' });
     const entry = findSite(store, parsed.hostname);
     const data = await legacyQueue.run(() => fetchArticle(context, target, {
       pageTimeoutMs: PAGE_TIMEOUT_MS,
@@ -421,6 +498,7 @@ async function shutdown() {
   shuttingDown = true;
   console.log('shutting down...');
   wsjQueue.close();
+  economistQueue.close();
   legacyQueue.close();
   server.close();
   await context.close().catch(() => {});

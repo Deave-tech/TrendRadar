@@ -1,5 +1,5 @@
 # coding=utf-8
-"""Configuration, models, and URL rules for WSJ document delivery."""
+"""Configuration, models, and URL rules for publisher document delivery."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Mapping, Optional
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
@@ -52,7 +53,7 @@ class UncertainRemoteResult(DeliveryError):
 
 @dataclass(frozen=True)
 class DeliveryConfig:
-    """Environment-backed settings for the independent WSJ delivery command."""
+    """Environment-backed settings for one publisher delivery command."""
 
     bpc_api_token: str
     feishu_app_id: str
@@ -81,10 +82,35 @@ class DeliveryConfig:
     image_allowed_hosts: tuple[str, ...] = ("images.wsj.net",)
     include_images: bool = False
     max_cloud_documents: int = 300
+    publisher: str = "wsj"
 
     @classmethod
-    def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> "DeliveryConfig":
+    def from_env(
+        cls,
+        environ: Optional[Mapping[str, str]] = None,
+        *,
+        publisher: str = "wsj",
+    ) -> "DeliveryConfig":
         env = os.environ if environ is None else environ
+        publisher = str(publisher).strip().lower()
+        if publisher not in {"wsj", "economist"}:
+            raise ConfigurationError("不支持的投递来源")
+        prefix = "WSJ" if publisher == "wsj" else "ECONOMIST"
+        default_feed = (
+            "http://127.0.0.1:4555/wsj-cn.xml"
+            if publisher == "wsj"
+            else "http://127.0.0.1:4556/economist.xml"
+        )
+        default_image_hosts = (
+            "images.wsj.net" if publisher == "wsj" else "www.economist.com"
+        )
+        if publisher == "economist" and str(
+            env.get("ECONOMIST_DELIVERY_DB", "")
+        ).strip():
+            raise ConfigurationError(
+                "ECONOMIST_DELIVERY_DB 不受支持；Economist 必须通过 "
+                "NEWS_DELIVERY_DB（或旧 WSJ_DELIVERY_DB）与 WSJ 共用 outbox"
+            )
 
         def required(name: str) -> str:
             value = str(env.get(name, "")).strip()
@@ -126,56 +152,76 @@ class DeliveryConfig:
             feishu_app_secret=required("FEISHU_APP_SECRET"),
             feishu_receive_id=required("FEISHU_RECEIVE_ID"),
             feishu_doc_url_prefix=required("FEISHU_DOC_URL_PREFIX").rstrip("/"),
-            feed_url=str(env.get("WSJ_FEED_URL", "http://127.0.0.1:4555/wsj-cn.xml")).strip(),
-            db_path=Path(str(env.get("WSJ_DELIVERY_DB", "/var/lib/trendradar/wsj-delivery.db")).strip()),
+            feed_url=str(env.get(f"{prefix}_FEED_URL", default_feed)).strip(),
+            db_path=Path(
+                str(
+                    env.get(
+                        "NEWS_DELIVERY_DB",
+                        env.get(
+                            "WSJ_DELIVERY_DB",
+                            "/var/lib/trendradar/wsj-delivery.db",
+                        ),
+                    )
+                ).strip()
+            ),
             bpc_base_url=str(env.get("BPC_BASE_URL", "http://127.0.0.1:8080")).strip().rstrip("/"),
             feishu_receive_id_type=str(env.get("FEISHU_RECEIVE_ID_TYPE", "chat_id")).strip(),
-            max_items_per_run=int_value("WSJ_MAX_ITEMS_PER_RUN", 20),
-            http_timeout=float_value("WSJ_HTTP_TIMEOUT", 120.0),
-            feed_timeout=float_value("WSJ_FEED_TIMEOUT", 20.0),
-            max_drain_seconds=int_value("WSJ_MAX_DRAIN_SECONDS", 5400),
-            alert_cooldown_seconds=int_value("WSJ_ALERT_COOLDOWN_SECONDS", 21600),
-            retry_base_seconds=int_value("WSJ_RETRY_BASE_SECONDS", 300),
-            retry_max_seconds=int_value("WSJ_RETRY_MAX_SECONDS", 21600),
-            circuit_min_seconds=int_value("WSJ_CIRCUIT_MIN_SECONDS", 900),
+            max_items_per_run=int_value(f"{prefix}_MAX_ITEMS_PER_RUN", 20),
+            http_timeout=float_value(f"{prefix}_HTTP_TIMEOUT", 120.0),
+            feed_timeout=float_value(f"{prefix}_FEED_TIMEOUT", 20.0),
+            max_drain_seconds=int_value(f"{prefix}_MAX_DRAIN_SECONDS", 5400),
+            alert_cooldown_seconds=int_value(f"{prefix}_ALERT_COOLDOWN_SECONDS", 21600),
+            retry_base_seconds=int_value(f"{prefix}_RETRY_BASE_SECONDS", 300),
+            retry_max_seconds=int_value(f"{prefix}_RETRY_MAX_SECONDS", 21600),
+            circuit_min_seconds=int_value(f"{prefix}_CIRCUIT_MIN_SECONDS", 900),
             block_interval_seconds=float_value("FEISHU_BLOCK_INTERVAL_SECONDS", 0.4),
             card_max_bytes=int_value("FEISHU_CARD_MAX_BYTES", 30000),
-            image_timeout=float_value("WSJ_IMAGE_TIMEOUT", 20.0),
-            image_max_bytes=int_value("WSJ_IMAGE_MAX_BYTES", 10 * 1024 * 1024),
-            image_max_count=int_value("WSJ_IMAGE_MAX_COUNT", 8),
-            image_max_redirects=int_value("WSJ_IMAGE_MAX_REDIRECTS", 3),
-            image_max_pixels=int_value("WSJ_IMAGE_MAX_PIXELS", 40_000_000),
+            image_timeout=float_value(f"{prefix}_IMAGE_TIMEOUT", 20.0),
+            image_max_bytes=int_value(f"{prefix}_IMAGE_MAX_BYTES", 10 * 1024 * 1024),
+            image_max_count=int_value(
+                f"{prefix}_IMAGE_MAX_COUNT", 8 if publisher == "wsj" else 20
+            ),
+            image_max_redirects=int_value(f"{prefix}_IMAGE_MAX_REDIRECTS", 3),
+            image_max_pixels=int_value(f"{prefix}_IMAGE_MAX_PIXELS", 40_000_000),
             image_allowed_hosts=tuple(
                 value.strip().lower().rstrip(".")
                 for value in str(
                     env.get(
-                        "WSJ_IMAGE_ALLOWED_HOSTS",
-                        "images.wsj.net",
+                        f"{prefix}_IMAGE_ALLOWED_HOSTS",
+                        default_image_hosts,
                     )
                 ).split(",")
                 if value.strip()
             ),
-            include_images=bool_value("WSJ_INCLUDE_IMAGES", False),
-            max_cloud_documents=int_value("WSJ_MAX_CLOUD_DOCUMENTS", 300),
+            include_images=bool_value(f"{prefix}_INCLUDE_IMAGES", False),
+            max_cloud_documents=int_value(
+                "NEWS_MAX_CLOUD_DOCUMENTS",
+                int_value("WSJ_MAX_CLOUD_DOCUMENTS", 300),
+            ),
+            publisher=publisher,
         )
         config.validate()
         return config
 
     def validate(self) -> None:
+        label = self.display_name
+        prefix = "WSJ" if self.publisher == "wsj" else "ECONOMIST"
+        if self.publisher not in {"wsj", "economist"}:
+            raise ConfigurationError("不支持的投递来源")
         if not self.db_path.is_absolute():
-            raise ConfigurationError("WSJ_DELIVERY_DB 必须是绝对路径")
+            raise ConfigurationError(f"{prefix}_DELIVERY_DB 必须是绝对路径")
         if not 1 <= self.max_items_per_run <= 20:
-            raise ConfigurationError("WSJ_MAX_ITEMS_PER_RUN 必须在 1 到 20 之间")
+            raise ConfigurationError(f"{prefix}_MAX_ITEMS_PER_RUN 必须在 1 到 20 之间")
         if self.feishu_receive_id_type != "chat_id":
-            raise ConfigurationError("WSJ 云文档投递当前仅支持 FEISHU_RECEIVE_ID_TYPE=chat_id")
+            raise ConfigurationError(f"{label} 云文档投递当前仅支持 FEISHU_RECEIVE_ID_TYPE=chat_id")
         if not self.feishu_receive_id.startswith("oc_"):
             raise ConfigurationError("FEISHU_RECEIVE_ID 必须是以 oc_ 开头的群 chat_id")
         if self.http_timeout <= 0 or self.feed_timeout <= 0:
             raise ConfigurationError("HTTP 超时必须大于 0")
         if self.max_drain_seconds <= 0:
-            raise ConfigurationError("WSJ_MAX_DRAIN_SECONDS 必须大于 0")
+            raise ConfigurationError(f"{prefix}_MAX_DRAIN_SECONDS 必须大于 0")
         if self.alert_cooldown_seconds < 21600:
-            raise ConfigurationError("WSJ_ALERT_COOLDOWN_SECONDS 不得小于 21600（6 小时）")
+            raise ConfigurationError(f"{prefix}_ALERT_COOLDOWN_SECONDS 不得小于 21600（6 小时）")
         if self.retry_base_seconds <= 0 or self.retry_max_seconds < self.retry_base_seconds:
             raise ConfigurationError("重试退避配置无效")
         if self.block_interval_seconds < 0.4:
@@ -183,17 +229,17 @@ class DeliveryConfig:
         if self.card_max_bytes > 30000 or self.card_max_bytes < 4096:
             raise ConfigurationError("FEISHU_CARD_MAX_BYTES 必须在 4096 到 30000 之间")
         if self.image_timeout <= 0 or self.image_timeout > 120:
-            raise ConfigurationError("WSJ_IMAGE_TIMEOUT 必须在 0 到 120 秒之间")
+            raise ConfigurationError(f"{prefix}_IMAGE_TIMEOUT 必须在 0 到 120 秒之间")
         if not 1024 <= self.image_max_bytes <= 20 * 1024 * 1024:
-            raise ConfigurationError("WSJ_IMAGE_MAX_BYTES 必须在 1KB 到 20MB 之间")
+            raise ConfigurationError(f"{prefix}_IMAGE_MAX_BYTES 必须在 1KB 到 20MB 之间")
         if not 0 <= self.image_max_count <= 20:
-            raise ConfigurationError("WSJ_IMAGE_MAX_COUNT 必须在 0 到 20 之间")
+            raise ConfigurationError(f"{prefix}_IMAGE_MAX_COUNT 必须在 0 到 20 之间")
         if not 0 <= self.image_max_redirects <= 5:
-            raise ConfigurationError("WSJ_IMAGE_MAX_REDIRECTS 必须在 0 到 5 之间")
+            raise ConfigurationError(f"{prefix}_IMAGE_MAX_REDIRECTS 必须在 0 到 5 之间")
         if not 1_000_000 <= self.image_max_pixels <= 100_000_000:
-            raise ConfigurationError("WSJ_IMAGE_MAX_PIXELS 必须在 100 万到 1 亿之间")
+            raise ConfigurationError(f"{prefix}_IMAGE_MAX_PIXELS 必须在 100 万到 1 亿之间")
         if not self.image_allowed_hosts:
-            raise ConfigurationError("WSJ_IMAGE_ALLOWED_HOSTS 不得为空")
+            raise ConfigurationError(f"{prefix}_IMAGE_ALLOWED_HOSTS 不得为空")
         for host in self.image_allowed_hosts:
             if (
                 not host
@@ -203,12 +249,32 @@ class DeliveryConfig:
                 or ":" in host
                 or host == "localhost"
             ):
-                raise ConfigurationError("WSJ_IMAGE_ALLOWED_HOSTS 包含无效域名")
+                raise ConfigurationError(f"{prefix}_IMAGE_ALLOWED_HOSTS 包含无效域名")
         if not 1 <= self.max_cloud_documents <= 10000:
-            raise ConfigurationError("WSJ_MAX_CLOUD_DOCUMENTS 必须在 1 到 10000 之间")
-        _validate_service_url(self.feed_url, "WSJ_FEED_URL", allow_loopback_http=True)
+            raise ConfigurationError("NEWS_MAX_CLOUD_DOCUMENTS 必须在 1 到 10000 之间")
+        _validate_service_url(self.feed_url, f"{prefix}_FEED_URL", allow_loopback_http=True)
         _validate_service_url(self.bpc_base_url, "BPC_BASE_URL", allow_loopback_http=True)
-        _validate_service_url(self.feishu_doc_url_prefix, "FEISHU_DOC_URL_PREFIX", allow_loopback_http=False)
+        _validate_feishu_doc_prefix(self.feishu_doc_url_prefix)
+
+    @property
+    def display_name(self) -> str:
+        return "WSJ" if self.publisher == "wsj" else "Economist"
+
+    @property
+    def source_name(self) -> str:
+        return "华尔街日报中文网" if self.publisher == "wsj" else "The Economist"
+
+    @property
+    def bpc_endpoint(self) -> str:
+        return "/v1/fetch" if self.publisher == "wsj" else "/v1/economist/fetch"
+
+    @property
+    def image_referer(self) -> str:
+        return (
+            "https://cn.wsj.com/"
+            if self.publisher == "wsj"
+            else "https://www.economist.com/"
+        )
 
 
 @dataclass(frozen=True)
@@ -220,6 +286,7 @@ class FeedArticle:
     title: str
     published_at: str = ""
     author: str = ""
+    publisher: str = "wsj"
 
 
 @dataclass(frozen=True)
@@ -274,6 +341,62 @@ def normalize_wsj_url(url: str) -> str:
     return urlunsplit(("https", "cn.wsj.com", path, "", ""))
 
 
+_ECONOMIST_PATH_RE = re.compile(
+    r"^/[a-z0-9-]+/[0-9]{4}/[0-9]{2}/[0-9]{2}/[a-z0-9][a-z0-9-]*$",
+    re.IGNORECASE,
+)
+_ECONOMIST_EXCLUDED_SECTIONS = {
+    "audio",
+    "films",
+    "interactive",
+    "podcast",
+    "podcasts",
+    "video",
+    "videos",
+}
+
+
+def normalize_economist_url(url: str) -> str:
+    """Return a strict canonical Economist dated-article URL."""
+    try:
+        parsed = urlsplit(str(url).strip())
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid URL") from exc
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if (
+        parsed.scheme.lower() != "https"
+        or hostname != "www.economist.com"
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("only https://www.economist.com is allowed")
+    path = re.sub(r"/{2,}", "/", parsed.path or "/").rstrip("/")
+    parts = [part.lower() for part in path.split("/") if part]
+    if (
+        not _ECONOMIST_PATH_RE.fullmatch(path)
+        or any(part in _ECONOMIST_EXCLUDED_SECTIONS for part in parts[:-4])
+    ):
+        raise ValueError("only dated Economist article paths are allowed")
+    try:
+        year, month, day = map(int, parts[-4:-1])
+        published = date(year, month, day)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Economist article path has an invalid date") from exc
+    if not 1900 <= published.year <= 2099:
+        raise ValueError("Economist article path has an invalid date")
+    return urlunsplit(("https", "www.economist.com", path, "", ""))
+
+
+def normalize_article_url(url: str, publisher: str = "wsj") -> str:
+    if publisher == "wsj":
+        return normalize_wsj_url(url)
+    if publisher == "economist":
+        return normalize_economist_url(url)
+    raise ValueError("unsupported publisher")
+
+
 def is_video_candidate(url: str, title: str = "") -> bool:
     try:
         parsed = urlsplit(str(url).strip())
@@ -295,7 +418,9 @@ def _has_video_marker(path: str, query: str) -> bool:
     )
 
 
-def extract_article_id(normalized_url: str) -> str:
+def extract_article_id(normalized_url: str, publisher: str = "wsj") -> str:
+    if publisher != "wsj":
+        return ""
     slug = urlsplit(normalized_url).path.rstrip("/").rsplit("/", 1)[-1]
     for pattern in (_UUID_RE, _HEX_ID_RE):
         match = pattern.search(slug)
@@ -304,8 +429,18 @@ def extract_article_id(normalized_url: str) -> str:
     return ""
 
 
-def make_article_key(normalized_url: str) -> tuple[str, str]:
-    article_id = extract_article_id(normalized_url)
+def make_article_key(
+    normalized_url: str,
+    publisher: str = "wsj",
+    feed_id: str = "",
+) -> tuple[str, str]:
+    if publisher == "economist":
+        candidate = str(feed_id).strip().lower()
+        if _UUID_RE.fullmatch(candidate):
+            return f"economist:{candidate}", candidate
+        digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
+        return f"economist-url:{digest}", ""
+    article_id = extract_article_id(normalized_url, publisher)
     if article_id:
         return f"wsj:{article_id}", article_id
     digest = hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
@@ -331,3 +466,25 @@ def _validate_service_url(value: str, name: str, *, allow_loopback_http: bool) -
     if parsed.scheme == "http" and allow_loopback_http and host in {"127.0.0.1", "localhost", "::1"}:
         return
     raise ConfigurationError(f"{name} 必须使用 HTTPS；仅回环地址允许 HTTP")
+
+
+def _validate_feishu_doc_prefix(value: str) -> None:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise ConfigurationError("FEISHU_DOC_URL_PREFIX 不是有效 URL") from exc
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not (
+        parsed.scheme.lower() == "https"
+        and (host == "feishu.cn" or host.endswith(".feishu.cn"))
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.rstrip("/") == "/docx"
+        and not parsed.query
+        and not parsed.fragment
+    ):
+        raise ConfigurationError(
+            "FEISHU_DOC_URL_PREFIX 必须是 https://<租户>.feishu.cn/docx"
+        )

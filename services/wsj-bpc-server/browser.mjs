@@ -8,6 +8,14 @@ import {
   validateWsjArticleUrl,
   validateWsjListUrl,
 } from './wsj.mjs';
+import {
+  economistArticleSha256,
+  EconomistFetchError,
+  extractEconomistSnapshot,
+  isEconomistChallengeUrl,
+  sanitizeEconomistImages,
+  validateEconomistArticleUrl,
+} from './economist.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -523,6 +531,57 @@ export async function readWsjSnapshot(page) {
   });
 }
 
+async function primeEconomistLazyImages(page, deadline) {
+  let plan;
+  try {
+    plan = await page.evaluate(() => {
+      const article = document.querySelector('article');
+      if (!article) return null;
+      const sections = Array.from(article.querySelectorAll('section'));
+      const bodySection = sections.sort((left, right) =>
+        right.querySelectorAll('p[data-component="paragraph"]').length -
+        left.querySelectorAll('p[data-component="paragraph"]').length
+      )[0];
+      if (!bodySection) return null;
+      const originalY = window.scrollY;
+      const rect = bodySection.getBoundingClientRect();
+      const top = Math.max(0, rect.top + window.scrollY);
+      const bottom = Math.max(top, rect.bottom + window.scrollY);
+      const viewport = Math.max(1, window.innerHeight || 800);
+      const steps = Math.min(8, Math.max(1, Math.ceil((bottom - top) / viewport)));
+      const positions = [];
+      for (let index = 0; index < steps; index++) {
+        const ratio = steps === 1 ? 0 : index / (steps - 1);
+        positions.push(Math.round(top + Math.max(0, bottom - top - viewport) * ratio));
+      }
+      // Visit every materialized body figure as well as coarse section points.
+      // Long photo essays otherwise stabilize before off-screen lazy images
+      // acquire currentSrc/srcset values.
+      for (const figure of Array.from(bodySection.querySelectorAll('figure')).slice(0, 30)) {
+        const figureTop = figure.getBoundingClientRect().top + window.scrollY;
+        positions.push(Math.max(0, Math.round(figureTop - viewport / 3)));
+      }
+      return { originalY, positions: Array.from(new Set(positions)) };
+    });
+  } catch {
+    return;
+  }
+  if (!plan) return;
+  try {
+    for (const position of plan.positions) {
+      if (Date.now() + 150 >= deadline) break;
+      await page.evaluate((y) => window.scrollTo(0, y), position);
+      await page.waitForTimeout(150);
+    }
+  } finally {
+    await page.evaluate((y) => window.scrollTo(0, y), plan.originalY).catch(() => {});
+  }
+}
+
+export async function readEconomistSnapshot(page) {
+  return page.evaluate(extractEconomistSnapshot);
+}
+
 /**
  * Fetch and extract a WSJ Chinese article. Unlike fetchArticle(), this never
  * returns the whole page and enforces the quality contract consumed by the
@@ -667,6 +726,173 @@ export async function fetchWsjArticle(
       paragraphCount: paragraphs.length,
       imageCount: images.length,
       sha256: articleSha256(paragraphs),
+      fetchedAt: new Date().toISOString(),
+    };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+/**
+ * Fetch one Economist prose article through BPC. The extraction is isolated
+ * from the legacy whole-page API and fails closed before any partial text can
+ * reach the document-delivery worker.
+ */
+export async function fetchEconomistArticle(
+  context,
+  url,
+  { pageTimeoutMs = 45000, settleMs = 6000 } = {}
+) {
+  const input = validateEconomistArticleUrl(url);
+  if (!input.ok)
+    throw new EconomistFetchError('URL_NOT_ALLOWED', 403, false, input.reason);
+  if (!browserConnected(context))
+    throw new EconomistFetchError('SERVICE_NOT_READY', 503, true, 'browser is not connected');
+
+  const page = await context.newPage();
+  const deadline = Date.now() + pageTimeoutMs;
+  let blockedNavigation = null;
+  try {
+    // Abort every main-frame navigation outside the exact dated-article scope.
+    // Subresources and frames remain available to the BPC extension.
+    await page.route('**/*', async (route) => {
+      const request = route.request();
+      if (request.resourceType() === 'document' && request.frame() === page.mainFrame()) {
+        const checked = validateEconomistArticleUrl(request.url());
+        if (!checked.ok) {
+          blockedNavigation = isEconomistChallengeUrl(request.url()) ? 'challenge' : 'scope';
+          return route.abort('blockedbyclient');
+        }
+      }
+      return route.fallback();
+    });
+
+    let response;
+    try {
+      response = await page.goto(input.url.href, {
+        waitUntil: 'domcontentloaded',
+        timeout: Math.max(1, deadline - Date.now()),
+      });
+    } catch (error) {
+      if (blockedNavigation === 'challenge')
+        throw new EconomistFetchError('CHALLENGE_DETECTED', 422, true, 'Cloudflare challenge redirect was blocked');
+      if (blockedNavigation === 'scope')
+        throw new EconomistFetchError('URL_NOT_ALLOWED', 403, false, 'cross-domain or non-article redirect was blocked');
+      throw new EconomistFetchError('UPSTREAM_ERROR', 502, true, 'upstream navigation failed', {
+        reason: error?.name === 'TimeoutError' ? 'timeout' : 'navigation',
+      });
+    }
+
+    const finalUrl = validateEconomistArticleUrl(page.url());
+    if (!finalUrl.ok && isEconomistChallengeUrl(page.url()))
+      throw new EconomistFetchError('CHALLENGE_DETECTED', 422, true, 'Cloudflare challenge redirect detected');
+    if (!finalUrl.ok)
+      throw new EconomistFetchError('URL_NOT_ALLOWED', 403, false, 'upstream redirected outside the allowed URL scope');
+    if (finalUrl.url.href !== input.url.href)
+      throw new EconomistFetchError('URL_NOT_ALLOWED', 403, false, 'upstream redirected to a different Economist article');
+    if (!response)
+      throw new EconomistFetchError('UPSTREAM_ERROR', 502, true, 'upstream returned no document response');
+    if (response.status() !== 200) {
+      const headers = response.headers();
+      let challenge = String(headers['cf-mitigated'] || '').toLowerCase() === 'challenge';
+      if (!challenge && response.status() === 403) {
+        challenge = await page.evaluate(() => {
+          const text = String(document.body?.textContent || '').slice(0, 5000);
+          return Boolean(document.querySelector(
+            '#challenge-running, #challenge-stage, .cf-challenge, iframe[src*="challenges.cloudflare.com"], script[src*="challenges.cloudflare.com"]'
+          )) || /just a moment|checking (?:your )?browser|verify (?:that )?you are human|enable javascript and cookies|cloudflare ray id|attention required|captcha/i.test(
+            `${document.title || ''}\n${text}`
+          );
+        }).catch(() => false);
+      }
+      if (challenge)
+        throw new EconomistFetchError('CHALLENGE_DETECTED', 422, true, 'Cloudflare challenge response detected');
+      throw new EconomistFetchError('UPSTREAM_STATUS', 502, true, 'upstream did not return HTTP 200', {
+        upstreamStatus: response.status(),
+      });
+    }
+
+    const initialWait = Math.min(settleMs, Math.max(0, deadline - Date.now()));
+    if (initialWait) await page.waitForTimeout(initialWait);
+    await primeEconomistLazyImages(page, deadline);
+
+    let lastSnapshot = null;
+    let lastText = '';
+    let lastImageManifest = '';
+    let lastImages = [];
+    let stableSamples = 0;
+    while (Date.now() < deadline) {
+      let snapshot;
+      try {
+        snapshot = await readEconomistSnapshot(page);
+      } catch {
+        throw new EconomistFetchError('UPSTREAM_ERROR', 502, true, 'article DOM could not be read');
+      }
+      lastSnapshot = snapshot;
+      if (snapshot.challenge || snapshot.bpcFailure) break;
+
+      const text = snapshot.paragraphs.join('\n\n');
+      const images = sanitizeEconomistImages(
+        snapshot.imageCandidates,
+        finalUrl.url.href,
+        snapshot.paragraphs.length,
+        snapshot.trustedHeroUrls
+      );
+      const imageManifest = JSON.stringify(images);
+      const usable = snapshot.articlePresent && snapshot.bodySectionPresent &&
+        !snapshot.paywall && text.length > 0;
+      if (usable && text === lastText && imageManifest === lastImageManifest) stableSamples++;
+      else stableSamples = usable ? 1 : 0;
+      lastText = usable ? text : '';
+      lastImageManifest = usable ? imageManifest : '';
+      lastImages = usable ? images : [];
+      if (stableSamples >= 3) break;
+      await page.waitForTimeout(Math.min(500, Math.max(1, deadline - Date.now())));
+    }
+
+    if (lastSnapshot?.challenge)
+      throw new EconomistFetchError('CHALLENGE_DETECTED', 422, true, 'Cloudflare challenge detected');
+    if (lastSnapshot?.bpcFailure)
+      throw new EconomistFetchError('BPC_FAILURE', 422, true, 'BPC reported that full text could not be recovered');
+    if (lastSnapshot?.paywall)
+      throw new EconomistFetchError('PAYWALL_PRESENT', 422, true, 'paywall remained after BPC processing');
+    if (!lastSnapshot?.articlePresent || !lastSnapshot?.bodySectionPresent)
+      throw new EconomistFetchError('ARTICLE_NOT_READY', 503, true, 'article body section was not available before timeout');
+    if (stableSamples < 3)
+      throw new EconomistFetchError('ARTICLE_NOT_READY', 503, true, 'article text and image manifest did not become stable before timeout');
+
+    const paragraphs = lastSnapshot.paragraphs;
+    const text = paragraphs.join('\n\n');
+    if (paragraphs.length < 3 || text.length < 500 || !lastSnapshot.title)
+      throw new EconomistFetchError('ARTICLE_QUALITY_FAILED', 422, false, 'article did not meet the minimum text quality gate', {
+        textLength: text.length,
+        paragraphCount: paragraphs.length,
+      });
+
+    const stableFinalUrl = validateEconomistArticleUrl(page.url());
+    if (!stableFinalUrl.ok || stableFinalUrl.url.href !== input.url.href)
+      throw new EconomistFetchError('URL_NOT_ALLOWED', 403, false, 'article URL changed outside the requested identity');
+    const canonicalResult = validateEconomistArticleUrl(lastSnapshot.canonical);
+    if (canonicalResult.ok && canonicalResult.url.href !== stableFinalUrl.url.href)
+      throw new EconomistFetchError('URL_NOT_ALLOWED', 403, false, 'article canonical URL does not match the requested identity');
+    const canonicalUrl = canonicalResult.ok ? canonicalResult.url.href : finalUrl.url.href;
+    let publishedAt = lastSnapshot.publishedAt || null;
+    if (publishedAt && Number.isNaN(Date.parse(publishedAt))) publishedAt = null;
+
+    return {
+      url: finalUrl.url.href,
+      canonicalUrl,
+      status: response.status(),
+      title: lastSnapshot.title,
+      author: lastSnapshot.author || null,
+      publishedAt,
+      paragraphs,
+      images: lastImages,
+      text,
+      textLength: text.length,
+      paragraphCount: paragraphs.length,
+      imageCount: lastImages.length,
+      sha256: economistArticleSha256(paragraphs),
       fetchedAt: new Date().toISOString(),
     };
   } finally {

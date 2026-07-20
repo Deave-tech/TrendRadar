@@ -1,5 +1,5 @@
 # coding=utf-8
-"""HTTP clients and Feishu payload builders for WSJ delivery."""
+"""HTTP clients and Feishu payload builders for publisher delivery."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from .models import (
     deterministic_uuid,
     is_video_candidate,
     make_article_key,
-    normalize_wsj_url,
+    normalize_article_url,
 )
 
 
@@ -34,6 +34,14 @@ _IMAGE_MIME_EXTENSIONS = {
     "image/png": "png",
     "image/gif": "gif",
     "image/webp": "webp",
+}
+
+_ECONOMIST_IMAGE_OUTPUT_FORMATS = {
+    "jpg": "jpg",
+    "jpeg": "jpg",
+    "png": "png",
+    "gif": "gif",
+    "webp": "webp",
 }
 
 
@@ -54,16 +62,26 @@ class DownloadedImage:
 class FeedClient:
     """Read the local RSS bridge (RSS/Atom or JSON Feed) and globally dedupe it."""
 
-    def __init__(self, url: str, timeout: float, session: Optional[requests.Session] = None):
+    def __init__(
+        self,
+        url: str,
+        timeout: float,
+        session: Optional[requests.Session] = None,
+        *,
+        publisher: str = "wsj",
+        display_name: str = "WSJ",
+    ):
         self.url = url
         self.timeout = timeout
+        self.publisher = publisher
+        self.display_name = display_name
         self.session = session or requests.Session()
         if hasattr(self.session, "trust_env"):
             self.session.trust_env = False
         self.session.headers.update(
             {
                 "Accept": "application/rss+xml, application/atom+xml, application/feed+json, application/json",
-                "User-Agent": "TrendRadar-WSJ-Delivery/1.0",
+                "User-Agent": f"TrendRadar-{display_name}-Delivery/1.0",
             }
         )
         for sensitive_header in ("Cookie", "Authorization", "Proxy-Authorization"):
@@ -73,11 +91,13 @@ class FeedClient:
         try:
             response = self.session.get(self.url, timeout=self.timeout)
         except requests.RequestException as exc:
-            raise DeliveryError("FEED_UNAVAILABLE", "WSJ feed 请求失败", retryable=True) from exc
+            raise DeliveryError(
+                "FEED_UNAVAILABLE", f"{self.display_name} feed 请求失败", retryable=True
+            ) from exc
         if response.status_code != 200:
             raise DeliveryError(
                 "FEED_HTTP_ERROR",
-                f"WSJ feed 返回 HTTP {response.status_code}",
+                f"{self.display_name} feed 返回 HTTP {response.status_code}",
                 retryable=response.status_code >= 500 or response.status_code == 429,
             )
         content = getattr(response, "content", b"")
@@ -90,7 +110,9 @@ class FeedClient:
             else:
                 raw_items = self._parse_xml(content)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise DeliveryError("FEED_INVALID", "WSJ feed 无法解析", retryable=True) from exc
+            raise DeliveryError(
+                "FEED_INVALID", f"{self.display_name} feed 无法解析", retryable=True
+            ) from exc
 
         result: list[FeedArticle] = []
         seen: set[str] = set()
@@ -100,10 +122,14 @@ class FeedClient:
             if not source_url or is_video_candidate(source_url, title):
                 continue
             try:
-                normalized = normalize_wsj_url(source_url)
+                normalized = normalize_article_url(source_url, self.publisher)
             except ValueError:
                 continue
-            key, article_id = make_article_key(normalized)
+            key, article_id = make_article_key(
+                normalized,
+                self.publisher,
+                str(raw.get("id") or ""),
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -116,10 +142,15 @@ class FeedClient:
                     title=title or normalized,
                     published_at=str(raw.get("published_at", "") or ""),
                     author=str(raw.get("author", "") or ""),
+                    publisher=self.publisher,
                 )
             )
         if not result:
-            raise DeliveryError("FEED_EMPTY", "WSJ feed 没有有效文章，保留现有状态", retryable=True)
+            raise DeliveryError(
+                "FEED_EMPTY",
+                f"{self.display_name} feed 没有有效文章，保留现有状态",
+                retryable=True,
+            )
         return result
 
     @staticmethod
@@ -137,6 +168,7 @@ class FeedClient:
             result.append(
                 {
                     "url": item.get("url") or item.get("external_url") or "",
+                    "id": item.get("id") or "",
                     "title": item.get("title") or "",
                     "published_at": item.get("date_published") or item.get("date_modified") or "",
                     "author": _json_feed_author(item),
@@ -158,6 +190,7 @@ class FeedClient:
             result.append(
                 {
                     "url": entry.get("link") or "",
+                    "id": entry.get("id") or entry.get("guid") or "",
                     "title": entry.get("title") or "",
                     "published_at": entry.get("published") or entry.get("updated") or "",
                     "author": author,
@@ -167,7 +200,7 @@ class FeedClient:
 
 
 class BPCClient:
-    """Strict client for the WSJ-only BPC API contract."""
+    """Strict client for one publisher-specific BPC API contract."""
 
     def __init__(
         self,
@@ -175,10 +208,16 @@ class BPCClient:
         token: str,
         timeout: float,
         session: Optional[requests.Session] = None,
+        *,
+        publisher: str = "wsj",
+        endpoint: str = "/v1/fetch",
     ) -> None:
-        self.url = f"{base_url.rstrip('/')}/v1/fetch"
+        if not endpoint.startswith("/") or "//" in endpoint:
+            raise ValueError("invalid BPC endpoint")
+        self.url = f"{base_url.rstrip('/')}{endpoint}"
         self.token = token
         self.timeout = timeout
+        self.publisher = publisher
         self.session = session or requests.Session()
         if hasattr(self.session, "trust_env"):
             self.session.trust_env = False
@@ -225,7 +264,7 @@ class BPCClient:
             or url
         )
         try:
-            canonical_url = normalize_wsj_url(str(final_url))
+            canonical_url = normalize_article_url(str(final_url), self.publisher)
         except ValueError as exc:
             raise DeliveryError(
                 "BPC_INVALID_FINAL_URL",
@@ -257,7 +296,11 @@ class BPCClient:
         fetched_at = str(article.get("fetchedAt") or article.get("fetched_at") or "")
         if not fetched_at:
             fetched_at = datetime.now(timezone.utc).isoformat()
-        body_items = _build_body_items(clean_paragraphs, article.get("images"))
+        body_items = _build_body_items(
+            clean_paragraphs,
+            article.get("images"),
+            publisher=self.publisher,
+        )
         return FetchedArticle(
             canonical_url=canonical_url,
             title=title,
@@ -273,7 +316,7 @@ class BPCClient:
 
 
 class ImageDownloader:
-    """Download only WSJ-owned HTTPS images with bounded redirects and bytes.
+    """Download only publisher-owned HTTPS images with bounded redirects and bytes.
 
     Image URLs ultimately originate in page HTML.  Treat them as untrusted even
     though the local BPC extractor has already restricted them to the article
@@ -289,6 +332,8 @@ class ImageDownloader:
         max_redirects: int = 3,
         max_pixels: int = 40_000_000,
         allowed_hosts: Sequence[str] = ("images.wsj.net",),
+        referer: str = "https://cn.wsj.com/",
+        user_agent: str = "TrendRadar-WSJ-Image/1.0",
         session: Optional[requests.Session] = None,
         resolver: Callable[..., list] = socket.getaddrinfo,
     ) -> None:
@@ -304,8 +349,8 @@ class ImageDownloader:
         self.session.headers.update(
             {
                 "Accept": "image/webp,image/png,image/jpeg,image/gif;q=0.9,*/*;q=0.1",
-                "Referer": "https://cn.wsj.com/",
-                "User-Agent": "TrendRadar-WSJ-Image/1.0",
+                "Referer": referer,
+                "User-Agent": user_agent,
                 "Accept-Encoding": "identity",
             }
         )
@@ -591,7 +636,7 @@ class FeishuClient:
 
         url = f"{self.API_BASE}/drive/v1/medias/upload_all"
         token_refreshed = False
-        filename = f"wsj-{image.sha256[:20]}.{image.extension}"
+        filename = f"article-{image.sha256[:20]}.{image.extension}"
         for attempt in range(self.max_attempts):
             token = self._get_token()
             try:
@@ -852,9 +897,10 @@ def build_document_plan(
     *,
     include_images: bool = False,
     image_max_count: int = 20,
+    source_name: str = "华尔街日报中文网",
 ) -> list[dict]:
     """Build a stable, ordered plan of text blocks and article-only images."""
-    lines = ["来源：华尔街日报中文网"]
+    lines = [f"来源：{source_name}"]
     if article.get("author"):
         lines.append(f"作者：{article['author']}")
     if article.get("published_at"):
@@ -922,10 +968,12 @@ def chunks(values: Sequence[dict], size: int = 50) -> Iterable[tuple[int, list[d
         yield index, list(values[index : index + size])
 
 
-def build_summary_card(rows: Sequence[dict]) -> dict:
+def build_summary_card(rows: Sequence[dict], display_name: str = "WSJ") -> dict:
     lines = []
     for row in rows:
-        title = _escape_markdown(str(row.get("title") or row.get("feed_title") or "WSJ 文章")[:180])
+        title = _escape_markdown(
+            str(row.get("title") or row.get("feed_title") or f"{display_name} 文章")[:180]
+        )
         url = str(row.get("document_url") or "")
         published = str(row.get("published_at") or row.get("feed_published_at") or "")
         line = f"• [{title}]({url})"
@@ -936,24 +984,31 @@ def build_summary_card(rows: Sequence[dict]) -> dict:
         "schema": "2.0",
         "header": {
             "template": "blue",
-            "title": {"tag": "plain_text", "content": f"WSJ 新文章（{len(rows)} 篇）"},
+            "title": {
+                "tag": "plain_text",
+                "content": f"{display_name} 新文章（{len(rows)} 篇）",
+            },
         },
         "body": {"elements": [{"tag": "markdown", "content": "\n\n".join(lines)}]},
     }
 
 
-def partition_summary_cards(rows: Sequence[dict], max_bytes: int = 30000) -> list[list[dict]]:
+def partition_summary_cards(
+    rows: Sequence[dict],
+    max_bytes: int = 30000,
+    display_name: str = "WSJ",
+) -> list[list[dict]]:
     """Partition rows so the serialized interactive card remains below the limit."""
     result: list[list[dict]] = []
     current: list[dict] = []
     for row in rows:
         candidate = current + [row]
-        if current and _card_size(build_summary_card(candidate)) > max_bytes:
+        if current and _card_size(build_summary_card(candidate, display_name)) > max_bytes:
             result.append(current)
             current = [row]
         else:
             current = candidate
-        if _card_size(build_summary_card(current)) > max_bytes:
+        if _card_size(build_summary_card(current, display_name)) > max_bytes:
             # A single unusually large row is still bounded by title truncation in
             # build_summary_card; this is a defensive hard failure rather than
             # sending an invalid request.
@@ -963,9 +1018,9 @@ def partition_summary_cards(rows: Sequence[dict], max_bytes: int = 30000) -> lis
     return result
 
 
-def message_uuid(rows: Sequence[dict]) -> str:
+def message_uuid(rows: Sequence[dict], publisher: str = "wsj") -> str:
     keys = sorted(str(row["article_key"]) for row in rows)
-    return deterministic_uuid("trendradar-wsj-message:" + ",".join(keys))
+    return deterministic_uuid(f"trendradar-{publisher}-message:" + ",".join(keys))
 
 
 def block_client_token(article_key: str, cursor: int) -> str:
@@ -1037,13 +1092,63 @@ def normalize_article_image_url(url: str, allowed_hosts: Sequence[str]) -> str:
         or parsed.password is not None
     ):
         raise DeliveryError(
-            "IMAGE_URL_NOT_ALLOWED", "正文图片地址不在 WSJ 允许范围", retryable=False
+            "IMAGE_URL_NOT_ALLOWED", "正文图片地址不在允许范围", retryable=False
         )
     path = parsed.path or "/"
-    return urlunsplit(("https", host, path, parsed.query, ""))
+    query = parsed.query
+    if host == "www.economist.com":
+        path = _canonicalize_economist_image_path(path)
+        query = ""
+    return urlunsplit(("https", host, path, query, ""))
 
 
-def _build_body_items(paragraphs: Sequence[str], raw_images) -> tuple[dict, ...]:
+def _canonicalize_economist_image_path(path: str) -> str:
+    """Make Economist Cloudflare bytes agree with the original MIME type.
+
+    `format=auto` returns WebP to our downloader while Economist's CDN retains
+    the source asset Content-Type.  Keep strict magic/header validation and
+    instead request the source format explicitly.  This also repairs durable
+    render plans fetched before BPC began emitting canonical image URLs.
+    """
+    transformed = re.fullmatch(
+        r"/cdn-cgi/image/([^/]+)(/content-assets/images/.+\.([a-z0-9]+))",
+        path,
+        re.IGNORECASE,
+    )
+    direct = re.fullmatch(
+        r"/content-assets/images/.+\.([a-z0-9]+)", path, re.IGNORECASE
+    )
+    if transformed:
+        extension = transformed.group(3)
+    elif direct:
+        extension = direct.group(1)
+    else:
+        extension = ""
+    output_format = _ECONOMIST_IMAGE_OUTPUT_FORMATS.get(extension.lower())
+    if not output_format:
+        raise DeliveryError(
+            "IMAGE_URL_NOT_ALLOWED",
+            "Economist 正文图片路径或源格式不受支持",
+            retryable=False,
+        )
+    if not transformed:
+        return path
+    directives = [
+        item.strip()
+        for item in transformed.group(1).split(",")
+        if item.strip()
+        and not re.match(r"^format(?:=|$)", item.strip(), re.IGNORECASE)
+    ]
+    directives.append(f"format={output_format}")
+    return f"/cdn-cgi/image/{','.join(directives)}{transformed.group(2)}"
+
+
+def _build_body_items(
+    paragraphs: Sequence[str],
+    raw_images,
+    *,
+    publisher: str = "wsj",
+) -> tuple[dict, ...]:
     """Merge BPC's article-scoped images into paragraphs without reordering either."""
     images_by_slot: dict[int, list[dict]] = {}
     seen_images: set[str] = set()
@@ -1064,19 +1169,33 @@ def _build_body_items(paragraphs: Sequence[str], raw_images) -> tuple[dict, ...]
             if position == len(paragraphs) - 1 and not article_tail:
                 continue
             try:
+                allowed_hosts = (
+                    ("images.wsj.net",)
+                    if publisher == "wsj"
+                    else ("www.economist.com",)
+                )
                 image_url = normalize_article_image_url(
-                    str(raw.get("url") or ""),
-                    ("images.wsj.net",),
+                    str(raw.get("url") or ""), allowed_hosts
                 )
             except DeliveryError:
                 continue
             parsed_image = urlsplit(image_url)
-            asset = re.match(r"^/(im-[a-z0-9_-]+)(?:/|$)", parsed_image.path, re.I)
-            image_key = (
-                f"{parsed_image.hostname}/{asset.group(1).lower()}"
-                if asset
-                else image_url
-            )
+            if publisher == "economist":
+                asset_path = re.search(
+                    r"(/content-assets/images/[^?#]+)$", parsed_image.path, re.I
+                )
+                if not asset_path:
+                    continue
+                image_key = f"{parsed_image.hostname}{asset_path.group(1).lower()}"
+            else:
+                asset = re.match(
+                    r"^/(im-[a-z0-9_-]+)(?:/|$)", parsed_image.path, re.I
+                )
+                image_key = (
+                    f"{parsed_image.hostname}/{asset.group(1).lower()}"
+                    if asset
+                    else image_url
+                )
             if image_key in seen_images:
                 continue
             seen_images.add(image_key)
@@ -1206,7 +1325,10 @@ def _is_systemic_bpc_error(status: int, code: str) -> bool:
         "DATADOME",
         "CAPTCHA",
         "PAYWALL",
+        "BPC_FAILURE",
         "BPC_NOT_READY",
+        "SERVICE_NOT_READY",
+        "BROWSER",
     )
     return any(marker in code for marker in markers)
 

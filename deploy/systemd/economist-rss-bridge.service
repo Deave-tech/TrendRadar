@@ -1,0 +1,21 @@
+[Unit]
+Description=The Economist RSS bridge for TrendRadar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/TrendRadar
+Environment=HOME=/home/ubuntu
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=trendradar
+UMask=0077
+ExecStart=/usr/bin/python3 /home/ubuntu/TrendRadar/scripts/economist_rss_bridge.py --host 127.0.0.1 --port 4556 --ttl 900 --snapshot /var/lib/trendradar/economist-rss-bridge.json --fetch-timeout 20 --max-workers 1 --max-items 80 --stale-after 3600
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=2min
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target
